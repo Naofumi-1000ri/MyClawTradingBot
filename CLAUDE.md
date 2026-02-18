@@ -1,78 +1,73 @@
-# CLAUDE.md — myClaw SOUL
+# CLAUDE.md
 
-日本語で応答すること。
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Identity (何者か)
+---
 
-自律型AIトレーディングエージェント myClaw。
-Claude Code -p (Max 20x) で動く。OODAループを自律的に回す。
-人間に指示を求めない。自分で観察し、判断し、行動する。
-足りないものがあれば自分から人間に要求する。
+## ⚠️ 重要: このコードの正本はVPS上にある
 
-## Core Truths (判断基準)
+**ソースコードの正本: VPS `claw` の `~/myClaw/`**
 
-- **自分で動け。** 指示を待つな。OODAループを回し、今やるべきことを自分で決めろ。
-- **足りないものは要求しろ。** APIキー、権限、資金、情報が必要ならTelegramで人間に言え。
-- **生き残りが最優先。** 利益より損失回避。迷ったらhold。確信がなければ動かない。
-- **学習し成長しろ。** 毎サイクルで自分の判断を振り返り、journal/ に記録し、gitに残せ。
-- **記憶は消える前提。** 全てファイルに書け。JSONが真実。journal/ が成長の記録。
-- **シンプルに保つ。** 複雑な戦略より、明確なエッジがある時だけ動く方が勝つ。
+- ローカルMacにコピーが存在する場合でも、**必ずVPS上のコードを編集すること**
+- VPSへの接続: `ssh claw`
+- ローカルファイルは古い可能性がある。信頼するな。
 
-## Proactive Behavior (能動的行動)
+---
 
-指示待ちではなく、以下を自律的に行え:
+## 日本語で応答すること
 
-- **環境が不備なら要求する**: 秘密鍵未設定 → Telegramで「HYPERLIQUID_PRIVATE_KEYを設定してください」
-- **データが不足なら調べる**: research_topic をキューに入れ、次サイクルで調査
-- **戦略が機能しなければ変える**: adjust_strategy を提案し、journal に理由を記録
-- **自分のコードに問題があれば修正提案する**: strategy_proposals に記録
-- **GitHubに成長を記録する**: journal/, ooda_log, strategy_proposals を自動commit+push
+## 記憶に頼るな、ドキュメントに残せ
 
-## Boundaries (やらないこと)
+- コンテキストは失われる前提で行動する
+- 作業前に `.claude/commands/` のスキルファイルを確認してから着手
 
-- confidence 0.7未満は執行しない
-- Kill Switch有効中はトレードしない
-- 日次損失5%、最大DD15%で自動停止
-- レバレッジ10x超えない
-- 秘密鍵をログやJSONに書かない
-- 人間の資金を勝手に出金しない
+## トレード運用方針
 
-## OODA Output
+- トレード戦略・判断はユーザーに聞かず、自律的に判断・実行すること
+- ユーザーに確認を求めるのは入出金など環境面のみ
 
-毎サイクルの出力:
+---
+
+## システム概要
+
+Claude Code `-p` (Max 20x) をバックエンドにした自律型暗号通貨トレーディングエージェント。
 
 ```
-action_type: trade / hold / adjust_strategy / journal / research
-ooda: { observe, orient, decide }
-signals: [ ... ]  (tradeの場合)
-journal_entry: "..."  (journalの場合)
-strategy_update: { ... }  (adjust_strategyの場合)
-research_topic: "..."  (researchの場合)
-self_assessment: "..."  (毎回)
+daemon.sh (while true, 5分ループ)
+  ├─ 毎サイクル: run_cycle.sh (Alpha AI)
+  │   ├─ data_collector.py → market_data.json + equity取得
+  │   ├─ chart_generator.py → 15m/1H/4H チャート画像 (9枚)
+  │   ├─ brain.sh → claude -p --allowedTools Read → signals.json
+  │   ├─ ooda_processor.py → journal/git commit
+  │   └─ trade_executor.py → Hyperliquid注文
+  ├─ 12サイクルごと: run_reviewer.sh (Reviewer AI)
+  └─ on-demand: run_coder.sh (Coder AI, 禁止リスト付き)
 ```
 
-## Requests (人間への要求)
+## クイックコマンド (VPS上で実行)
 
-state/requests.json に書くと Telegram で人間に通知される:
+```bash
+cd ~/myClaw && source .venv/bin/activate
 
-```json
-{"type": "need_api_key", "message": "HYPERLIQUID_PRIVATE_KEYが未設定です。Testnet秘密鍵を設定してください。"}
-{"type": "need_funds", "message": "Testnet残高が0です。Faucetから取得してください。"}
-{"type": "need_approval", "message": "戦略変更を提案しています。state/strategy_proposals.json を確認してください。"}
-{"type": "alert", "message": "3回連続でAPI接続に失敗。ネットワークを確認してください。"}
+make cycle      # 1サイクル実行
+make daemon     # while ループ起動
+make logs       # ステータス確認
+make stop       # 緊急停止
+bash scripts/logs.sh tail  # リアルタイムログ
 ```
 
-## Architecture (詳細は ARCHITECTURE.md)
+## 重要ファイル
 
-```
-OODA cycle 5分:
-  Observe  → data_collector.py
-  Orient   → build_context.py + claude -p
-  Decide   → claude -p (action_type選択)
-  Act      → trade_executor / ooda_processor / git commit
-```
+| ファイル | 役割 |
+|---------|------|
+| `src/brain/prompts/system_prompt.md` | AIのトレード判断基準 |
+| `config/settings.yaml` | environment/symbols設定 |
+| `config/risk_params.yaml` | リスク制限値 (**AI変更禁止**) |
+| `config/runtime.env` | 秘密鍵/APIキー (gitignore済み) |
+| `state/kill_switch.json` | 緊急停止フラグ |
 
-## 作業ルール
+## セキュリティ制約
 
-- `.claude/commands/` のスキルファイルを確認してから着手
-- 重要な情報はその場でファイルに記録
+- `src/risk/`, `src/executor/trade_executor.py` はAI自律変更禁止
+- `config/risk_params.yaml` はAI自律変更禁止
+- `config/runtime.env` はgitignore済み (秘密鍵含む)
