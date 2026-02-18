@@ -1,0 +1,180 @@
+"""Chart generator: ローソク足 + MACD + RSI + 出来高チャートを画像生成"""
+
+import json
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")  # headless
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import mplfinance as mpf
+import numpy as np
+import pandas as pd
+
+from src.utils.config_loader import get_data_dir, load_settings
+from src.utils.file_lock import read_json
+from src.utils.logger import setup_logger
+
+logger = setup_logger("chart_generator")
+
+CHARTS_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "charts"
+
+
+def _calc_rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    delta = close.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.rolling(window=period, min_periods=period).mean()
+    avg_loss = loss.rolling(window=period, min_periods=period).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def _calc_macd(close: pd.Series):
+    ema12 = close.ewm(span=12).mean()
+    ema26 = close.ewm(span=26).mean()
+    macd_line = ema12 - ema26
+    signal_line = macd_line.ewm(span=9).mean()
+    histogram = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+
+def _calc_ema(close: pd.Series, span: int) -> pd.Series:
+    return close.ewm(span=span).mean()
+
+
+def generate_chart(symbol: str, candles: list, output_path: Path) -> bool:
+    """Generate a candlestick chart with MACD, RSI, and volume.
+    
+    Returns True if chart was generated successfully.
+    """
+    if not candles or len(candles) < 5:
+        logger.warning("Not enough candles for %s (%d)", symbol, len(candles) if candles else 0)
+        return False
+
+    try:
+        # Build DataFrame
+        rows = []
+        for c in candles:
+            ts = pd.Timestamp(int(c["t"]), unit="ms", tz="UTC")
+            rows.append({
+                "Date": ts,
+                "Open": float(c["o"]),
+                "High": float(c["h"]),
+                "Low": float(c["l"]),
+                "Close": float(c["c"]),
+                "Volume": float(c["v"]),
+            })
+        df = pd.DataFrame(rows)
+        df.set_index("Date", inplace=True)
+
+        if len(df) < 5:
+            return False
+
+        # Calculate indicators
+        close = df["Close"]
+        ema9 = _calc_ema(close, 9)
+        ema21 = _calc_ema(close, 21)
+        rsi = _calc_rsi(close, 14)
+        macd_line, signal_line, macd_hist = _calc_macd(close)
+
+        # Price change for title
+        first_px = df["Close"].iloc[0]
+        last_px = df["Close"].iloc[-1]
+        chg_pct = (last_px - first_px) / first_px * 100
+
+        # Create chart with mplfinance
+        # Custom style
+        mc = mpf.make_marketcolors(
+            up="#26a69a", down="#ef5350",
+            edge="inherit", wick="inherit",
+            volume={"up": "#26a69a80", "down": "#ef535080"},
+        )
+        style = mpf.make_mpf_style(
+            marketcolors=mc, 
+            gridstyle="-", gridcolor="#e0e0e0",
+            facecolor="white",
+            rc={"font.size": 8},
+        )
+
+        # EMA overlays
+        ema_plots = [
+            mpf.make_addplot(ema9, color="#2196F3", width=1.0, label="EMA9"),
+            mpf.make_addplot(ema21, color="#FF9800", width=1.0, label="EMA21"),
+        ]
+
+        # RSI panel
+        rsi_plot = [
+            mpf.make_addplot(rsi, panel=2, color="#9C27B0", width=1.0, ylabel="RSI"),
+            mpf.make_addplot(pd.Series(70, index=df.index), panel=2, color="red", linestyle="--", width=0.5),
+            mpf.make_addplot(pd.Series(30, index=df.index), panel=2, color="green", linestyle="--", width=0.5),
+        ]
+
+        # MACD panel
+        macd_colors = ["#26a69a" if v >= 0 else "#ef5350" for v in macd_hist]
+        macd_plot = [
+            mpf.make_addplot(macd_line, panel=3, color="#2196F3", width=1.0, ylabel="MACD"),
+            mpf.make_addplot(signal_line, panel=3, color="#FF9800", width=1.0),
+            mpf.make_addplot(macd_hist, panel=3, type="bar", color=macd_colors, width=0.7),
+        ]
+
+        all_plots = ema_plots + rsi_plot + macd_plot
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        fig, axes = mpf.plot(
+            df, type="candle", style=style,
+            addplot=all_plots,
+            volume=True,
+            panel_ratios=(4, 1, 1.5, 1.5),
+            figsize=(12, 8),
+            title=f"{symbol}  15m  |    ({chg_pct:+.1f}%)  |  {datetime.now(timezone.utc).strftime('%H:%M UTC')}",
+            returnfig=True,
+        )
+
+        fig.savefig(str(output_path), dpi=100, bbox_inches="tight", facecolor="white")
+        plt.close(fig)
+        logger.info("Chart generated: %s -> %s", symbol, output_path)
+        return True
+
+    except Exception as e:
+        logger.error("Chart generation failed for %s: %s", symbol, e)
+        return False
+
+
+def generate_all_charts(settings: dict = None) -> list:
+    """Generate charts for all symbols from market_data.json.
+    
+    Returns list of generated chart paths.
+    """
+    if settings is None:
+        settings = load_settings()
+
+    data_dir = get_data_dir(settings)
+    market_data_path = data_dir / "market_data.json"
+
+    try:
+        data = read_json(market_data_path)
+    except FileNotFoundError:
+        logger.error("No market data found at %s", market_data_path)
+        return []
+
+    charts = []
+    symbols_data = data.get("symbols", {})
+
+    for symbol, sym_data in symbols_data.items():
+        candles = sym_data.get("candles_15m", [])
+        chart_path = CHARTS_DIR / f"{symbol}.png"
+        if generate_chart(symbol, candles, chart_path):
+            charts.append(str(chart_path))
+
+    logger.info("Generated %d charts", len(charts))
+    return charts
+
+
+if __name__ == "__main__":
+    charts = generate_all_charts()
+    for c in charts:
+        print(f"  {c}")

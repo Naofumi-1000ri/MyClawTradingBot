@@ -1,0 +1,45 @@
+# myClaw Global Settings
+
+# Environment: testnet or mainnet
+environment: mainnet
+
+# Hyperliquid API endpoints
+hyperliquid:
+  mainnet_url: "https://api.hyperliquid.xyz"
+  testnet_url: "https://api.hyperliquid-testnet.xyz"
+
+# Trading pairs to monitor
+trading:
+  symbols:
+    - "BTC"
+    - "ETH"
+    - "SOL"
+  default_leverage: 3
+  max_leverage: 10
+  min_confidence: 0.7
+
+# AI Brain settings
+brain:
+  model: "sonnet"  # sonnet for regular cycles, opus for weekly analysis
+  session_reset_hours: 24
+  max_candles: 24        # 15-min candles to include in context
+  orderbook_depth: 5     # orderbook levels to include
+
+# Cycle settings
+cycle:
+  interval_minutes: 5
+  data_staleness_seconds: 300  # skip if data older than this
+
+# Paths (relative to project root)
+paths:
+  data_dir: "data"
+  signals_dir: "signals"
+  state_dir: "state"
+  logs_dir: "logs"
+
+# Telegram notifications
+telegram:
+  bot_token: ""
+  chat_id: 0
+  enabled: true
+  # bot_token and chat_id loaded from secrets

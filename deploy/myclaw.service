@@ -1,0 +1,16 @@
+[Unit]
+Description=myClaw Trading Cycle
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=myclaw
+Group=myclaw
+WorkingDirectory=/opt/myclaw
+ExecStart=/opt/myclaw/scripts/run_cycle.sh
+Environment=PYTHONPATH=/opt/myclaw
+EnvironmentFile=-/opt/myclaw/config/runtime.env
+StandardOutput=append:/opt/myclaw/logs/cycle.log
+StandardError=append:/opt/myclaw/logs/cycle.log
+TimeoutStartSec=300

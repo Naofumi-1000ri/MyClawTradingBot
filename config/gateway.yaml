@@ -1,0 +1,30 @@
+# myClaw Gateway Configuration
+
+claude:
+  model: "sonnet"
+
+# Telegram bot (set TELEGRAM_BOT_TOKEN env var)
+telegram:
+  bot_token: ""          # or set TELEGRAM_BOT_TOKEN env var
+  allowed_users: []      # Telegram user IDs. Empty = allow all
+
+# Scheduled jobs
+scheduler:
+  jobs:
+    - name: "trade_cycle"
+      interval_minutes: 5
+      script: "bash scripts/run_cycle.sh"
+      prompt: ""
+
+    - name: "daily_summary"
+      interval_minutes: 1440  # 24h
+      prompt: |
+        本日のトレード結果をサマリーしてください。
+        state/daily_pnl.json と state/trade_history.json を確認して、
+        簡潔なレポートを生成してください。
+
+# Webhook (HTTP API)
+webhook:
+  enabled: false
+  port: 8080
+  secret: ""  # X-Webhook-Secret header for auth

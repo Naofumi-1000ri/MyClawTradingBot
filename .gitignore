@@ -1,0 +1,43 @@
+# Runtime data (volatile)
+data/
+signals/
+logs/
+
+# State - keep ooda_log and strategy_proposals in git
+state/*
+!state/ooda_log.json
+!state/strategy_proposals.json
+!state/research_queue.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Secrets
+config/secrets.env
+config/secrets.env.gpg
+*.gpg
+!config/secrets.env.gpg
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+*.env.local

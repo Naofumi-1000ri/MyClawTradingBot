@@ -1,0 +1,162 @@
+"""Market data collector for Hyperliquid."""
+
+import os
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+from hyperliquid.info import Info
+
+from src.utils.config_loader import (
+    get_data_dir,
+    get_hyperliquid_url,
+    load_settings,
+)
+from src.utils.file_lock import atomic_write_json, read_json
+from src.utils.logger import setup_logger
+
+logger = setup_logger("data_collector")
+
+
+def _build_info(settings: dict) -> Info:
+    """Create Hyperliquid Info client."""
+    base_url = get_hyperliquid_url(settings)
+    logger.info("Connecting to Hyperliquid: %s", base_url)
+    return Info(base_url, skip_ws=True)
+
+
+def _fetch_mid_prices(info: Info) -> dict[str, str]:
+    """Fetch all mid prices."""
+    return info.all_mids()
+
+
+def _fetch_candles(info: Info, symbol: str, count: int = 24) -> list[dict]:
+    """Fetch latest 15m candles for a symbol."""
+    now_ms = int(time.time() * 1000)
+    # 24 candles * 15 min * 60 sec * 1000 ms, with buffer
+    start_ms = now_ms - count * 15 * 60 * 1000 - 60_000
+    candles = info.candles_snapshot(
+        name=symbol, interval="15m", startTime=start_ms, endTime=now_ms
+    )
+    # Keep only the latest `count` candles
+    return candles[-count:]
+
+
+def _fetch_orderbook(info: Info, symbol: str, depth: int = 5) -> dict:
+    """Fetch L2 orderbook snapshot (top N levels)."""
+    snapshot = info.l2_snapshot(name=symbol)
+    levels = snapshot.get("levels", [[], []])
+    bids = levels[0][:depth] if len(levels) > 0 else []
+    asks = levels[1][:depth] if len(levels) > 1 else []
+    return {
+        "bids": [{"px": lv["px"], "sz": lv["sz"]} for lv in bids],
+        "asks": [{"px": lv["px"], "sz": lv["sz"]} for lv in asks],
+    }
+
+
+def _fetch_funding_rates(info: Info) -> dict[str, float]:
+    """Fetch funding rates for all assets."""
+    meta, asset_ctxs = info.meta_and_asset_ctxs()
+    universe = meta.get("universe", [])
+    rates = {}
+    for i, asset in enumerate(universe):
+        name = asset.get("name", "")
+        if i < len(asset_ctxs):
+            funding = asset_ctxs[i].get("funding", "0")
+            rates[name] = float(funding)
+    return rates
+
+
+def collect(settings: dict | None = None) -> dict:
+    """Collect market data for all configured symbols.
+
+    Returns the full market data dict that was written to disk.
+    """
+    if settings is None:
+        settings = load_settings()
+
+    symbols = settings.get("trading", {}).get("symbols", [])
+    orderbook_depth = settings.get("brain", {}).get("orderbook_depth", 5)
+    max_candles = settings.get("brain", {}).get("max_candles", 24)
+    data_dir = get_data_dir(settings)
+    output_path = data_dir / "market_data.json"
+
+    info = _build_info(settings)
+
+    # Load previous data as fallback
+    prev_data: dict = {}
+    try:
+        prev_data = read_json(output_path)
+    except (FileNotFoundError, Exception):
+        pass
+
+    # Fetch shared data
+    try:
+        all_mids = _fetch_mid_prices(info)
+    except Exception as e:
+        logger.error("Failed to fetch mid prices: %s", e)
+        all_mids = {}
+
+    try:
+        funding_rates = _fetch_funding_rates(info)
+    except Exception as e:
+        logger.error("Failed to fetch funding rates: %s", e)
+        funding_rates = {}
+
+    # Build per-symbol data
+    symbols_data: dict[str, dict] = {}
+    for sym in symbols:
+        prev_sym = prev_data.get("symbols", {}).get(sym, {})
+
+        # Mid price
+        mid = all_mids.get(sym)
+        if mid is not None:
+            mid_price = float(mid)
+        elif prev_sym.get("mid_price") is not None:
+            mid_price = prev_sym["mid_price"]
+            logger.warning("Using previous mid_price for %s", sym)
+        else:
+            mid_price = None
+
+        # Candles
+        try:
+            candles = _fetch_candles(info, sym, count=max_candles)
+        except Exception as e:
+            logger.error("Failed to fetch candles for %s: %s", sym, e)
+            candles = prev_sym.get("candles_15m", [])
+
+        # Orderbook
+        try:
+            orderbook = _fetch_orderbook(info, sym, depth=orderbook_depth)
+        except Exception as e:
+            logger.error("Failed to fetch orderbook for %s: %s", sym, e)
+            orderbook = prev_sym.get("orderbook", {"bids": [], "asks": []})
+
+        # Funding rate
+        fr = funding_rates.get(sym)
+        if fr is None:
+            fr = prev_sym.get("funding_rate")
+            if fr is not None:
+                logger.warning("Using previous funding_rate for %s", sym)
+
+        symbols_data[sym] = {
+            "mid_price": mid_price,
+            "candles_15m": candles,
+            "orderbook": orderbook,
+            "funding_rate": fr,
+        }
+
+    result = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "symbols": symbols_data,
+    }
+
+    atomic_write_json(output_path, result)
+    logger.info(
+        "Market data saved: %d symbols -> %s", len(symbols_data), output_path
+    )
+    return result
+
+
+if __name__ == "__main__":
+    collect()

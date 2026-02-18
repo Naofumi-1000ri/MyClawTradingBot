@@ -1,0 +1,23 @@
+# myClaw Risk Parameters
+
+# Position sizing
+position:
+  max_single_pct: 10.0      # Max 10% of equity per position
+  max_total_exposure_pct: 30.0  # Max 30% total exposure
+  max_concurrent: 3          # Max 3 simultaneous positions
+
+# Loss limits
+loss_limits:
+  daily_loss_pct: 5.0        # Kill switch at 5% daily loss
+  max_drawdown_pct: 15.0     # Kill switch at 15% max drawdown
+
+# Kill switch
+kill_switch:
+  cooldown_hours: 6          # Hours to wait after kill switch triggered
+  auto_close_positions: true # Close all positions when triggered
+
+# Order constraints
+orders:
+  max_leverage: 10
+  min_order_size_usd: 10.0
+  max_slippage_pct: 0.5

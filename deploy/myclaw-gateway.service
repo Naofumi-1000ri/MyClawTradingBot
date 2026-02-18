@@ -1,0 +1,20 @@
+[Unit]
+Description=myClaw Gateway (Autonomous Agent)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=myclaw
+Group=myclaw
+WorkingDirectory=/opt/myclaw
+ExecStart=/usr/bin/python3 -m src.gateway.server
+Environment=PYTHONPATH=/opt/myclaw
+EnvironmentFile=-/opt/myclaw/config/runtime.env
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/opt/myclaw/logs/gateway.log
+StandardError=append:/opt/myclaw/logs/gateway.log
+
+[Install]
+WantedBy=multi-user.target
