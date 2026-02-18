@@ -36,24 +36,34 @@ class RiskManager:
         if len(positions) >= max_concurrent:
             return False, f"Max concurrent positions ({max_concurrent}) reached"
 
-        # Single position size check (max 10% of equity)
-        max_single_pct = self.position.get("max_single_pct", 10.0)
-        size_usd = float(signal.get("size_usd", 0))
-        leverage = float(signal.get("leverage", 1))
-        if equity > 0 and (size_usd / equity) * 100 > max_single_pct:
-            return False, f"Position size {size_usd:.2f} exceeds {max_single_pct}% of equity ({equity:.2f})"
-
         # Leverage check
+        leverage = float(signal.get("leverage", 1))
         max_leverage = self.orders.get("max_leverage", 10)
         if leverage > max_leverage:
             return False, f"Leverage {leverage}x exceeds max {max_leverage}x"
 
-        # Total exposure check (max 30%)
+        # Single position size check (max 10% of equity, margin basis)
+        max_single_pct = self.position.get("max_single_pct", 10.0)
+        size = float(signal.get("size") or 0)
+        entry = float(signal.get("entry_price") or 0)
+        if size > 0 and entry > 0:
+            notional = size * entry
+            margin_required = notional / max(leverage, 1)
+            if equity > 0 and (margin_required / equity) * 100 > max_single_pct:
+                return False, f"Margin required {margin_required:.2f} exceeds {max_single_pct}% of equity ({equity:.2f})"
+        elif size > 0 and entry == 0 and equity > 0:
+            # entry_price 未設定 (成行注文): size に対してmax_singleの上限チェックをスキップするが
+            # executor の _calculate_size() がエクイティベースで計算するため二重チェック不要
+            pass  # executor side constraint applies
+
+        # Total exposure check (max 30%, notional basis)
         max_total_pct = self.position.get("max_total_exposure_pct", 30.0)
         current_exposure = sum(
-            abs(float(p.get("size_usd", 0))) for p in positions
+            abs(float(p.get("size", 0))) * float(p.get("entry_price", 0) or p.get("entryPx", 0))
+            for p in positions
         )
-        new_total = current_exposure + size_usd
+        new_notional = size * entry if (size > 0 and entry > 0) else 0
+        new_total = current_exposure + new_notional
         if equity > 0 and (new_total / equity) * 100 > max_total_pct:
             return False, f"Total exposure {new_total:.2f} would exceed {max_total_pct}% of equity ({equity:.2f})"
 

@@ -26,7 +26,7 @@ from src.risk.kill_switch import is_active
 if is_active():
     print('Kill switch is ACTIVE. Skipping cycle.')
     exit(1)
-" || { echo "Kill switch active or check failed. Aborting."; exit 0; }
+" || { echo "Kill switch active or check failed. Aborting."; exit 1; }
 
 # 2. Observe
 echo "[$TIMESTAMP] [Observe] Collecting market data..."
@@ -38,7 +38,10 @@ bash src/brain/brain.sh || { echo "Brain failed"; exit 1; }
 
 # 4. Act: OODA処理
 echo "[$TIMESTAMP] [Act] Processing OODA output..."
-python3 -m src.brain.ooda_processor || echo "OODA processing had errors"
+if ! python3 -m src.brain.ooda_processor; then
+    echo "[$TIMESTAMP] [WARN] OODA processing failed - clearing signals to prevent stale trades"
+    echo '{"action_type":"hold","signals":[],"market_summary":"ooda_processor failed","ooda":{"observe":"","orient":"","decide":""}}'  > signals/signals.json
+fi
 
 # 5. Act: action_type に応じて分岐
 ACTION_TYPE=$(python3 -c "

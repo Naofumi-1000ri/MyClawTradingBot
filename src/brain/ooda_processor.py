@@ -101,8 +101,9 @@ def _process_journal(output: dict) -> None:
     content += "---\n"
 
     # Append to today's journal
+    is_new = not journal_file.exists() or journal_file.stat().st_size == 0
     with open(journal_file, "a") as f:
-        if journal_file.stat().st_size == 0 or not journal_file.exists():
+        if is_new:
             f.write(f"# Trading Journal - {today}\n")
         f.write(content)
 
@@ -259,7 +260,7 @@ def _git_commit(output: dict) -> None:
         else:
             logger.debug("Git commit skipped: %s", result.stderr.decode()[:100])
     except Exception:
-        logger.debug("Git commit failed (non-critical)")
+        logger.warning("Git commit failed")
 
 
 if __name__ == "__main__":

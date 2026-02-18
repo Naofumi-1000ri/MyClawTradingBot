@@ -9,7 +9,7 @@ from src.utils.logger import setup_logger
 
 logger = setup_logger("state_manager")
 
-MAX_TRADE_HISTORY = 100
+MAX_TRADE_HISTORY = 500
 
 
 class StateManager:
@@ -58,7 +58,7 @@ class StateManager:
                     "side": "long" if szi > 0 else "short",
                     "size": abs(szi),
                     "entry_price": entry,
-                    "leverage": int(float(p.get("leverage", {}).get("value", 1))) if isinstance(p.get("leverage"), dict) else 1,
+                    "leverage": int(float(p["leverage"]["value"] if isinstance(p.get("leverage"), dict) else p.get("leverage") or 1)) if isinstance(p.get("leverage"), dict) else 1,
                     "opened_at": None,
                     "unrealized_pnl": upnl,
                     "mid_price": mid,
@@ -73,7 +73,7 @@ class StateManager:
     # -- Trade History --
 
     def record_trade(self, trade: dict) -> None:
-        """Append a trade to trade_history.json (max 100 entries)."""
+        """Append a trade to trade_history.json (max 500 entries)."""
         path = self.state_dir / "trade_history.json"
         try:
             history = read_json(path)
@@ -105,9 +105,15 @@ class StateManager:
             pnl = {"date": today, "realized_pnl": 0, "unrealized_pnl": 0, "equity": equity, "peak_equity": equity}
 
         pnl["realized_pnl"] = float(pnl.get("realized_pnl", 0)) + realized_pnl
+        # unrealized_pnl = 現在エクイティ - 開始エクイティ - 実現損益
+        start = float(pnl.get("equity", equity)) if pnl.get("date") == pnl.get("date") else equity
+        starting_equity = float(pnl.get("peak_equity", equity)) if pnl.get("date") == today else equity
+        # data_collectorから渡される equityは含み損益込みなので差分で計算
+        pnl["unrealized_pnl"] = equity - float(pnl.get("equity", equity))
         pnl["equity"] = equity
         pnl["peak_equity"] = max(float(pnl.get("peak_equity", 0)), equity)
         
         atomic_write_json(self.state_dir / "daily_pnl.json", pnl)
-        logger.info("Daily P&L updated: realized=%.2f equity=%.2f", pnl["realized_pnl"], equity)
+        logger.info("Daily P&L updated: realized=%.2f unrealized=%.2f equity=%.2f",
+                    pnl["realized_pnl"], pnl["unrealized_pnl"], equity)
         return pnl

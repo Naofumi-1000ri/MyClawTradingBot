@@ -24,6 +24,25 @@ def _read_safe(path: Path) -> dict:
         return {}
 
 
+
+def _close_all_positions() -> None:
+    """Emergency close all open positions."""
+    try:
+        from src.executor.trade_executor import TradeExecutor
+        executor = TradeExecutor()
+        positions = executor.state.get_positions()
+        if not positions:
+            logger.info("No positions to close")
+            return
+        for pos in positions:
+            symbol = pos.get("symbol", "")
+            if symbol:
+                logger.warning("Emergency closing %s", symbol)
+                executor.close_position(symbol)
+    except Exception:
+        logger.exception("Emergency close failed")
+
+
 def run_monitor() -> None:
     """Run one monitoring cycle."""
     signals_dir = get_signals_dir()
@@ -80,6 +99,33 @@ def run_monitor() -> None:
         msg = f"KILL SWITCH ACTIVE: {reason}"
         logger.warning(msg)
         alerts.append(msg)
+
+
+    # 4b. Risk limit checks (daily loss / max drawdown)
+    if daily_pnl and float(daily_pnl.get("equity", 0)) > 0:
+        try:
+            from src.risk.risk_manager import RiskManager
+            from src.risk.kill_switch import activate as ks_activate, is_active as ks_is_active
+            if not ks_is_active():
+                rm = RiskManager()
+                equity = float(daily_pnl.get("equity", 0))
+                peak_equity = float(daily_pnl.get("peak_equity", equity))
+                if rm.check_daily_loss(daily_pnl, equity):
+                    ks_activate("daily_loss_5pct_exceeded")
+                    _close_all_positions()
+                    msg = "KILL SWITCH: 日次損失5%超過"
+                    logger.critical(msg)
+                    alerts.append(msg)
+                    send_message(f"*KILL SWITCH* {msg}")
+                elif rm.check_max_drawdown(equity, peak_equity):
+                    ks_activate("max_drawdown_15pct_exceeded")
+                    _close_all_positions()
+                    msg = "KILL SWITCH: 最大DD15%超過"
+                    logger.critical(msg)
+                    alerts.append(msg)
+                    send_message(f"*KILL SWITCH* {msg}")
+        except Exception:
+            logger.exception("Risk limit check failed")
 
     # 5. Send alerts if any
     if alerts:

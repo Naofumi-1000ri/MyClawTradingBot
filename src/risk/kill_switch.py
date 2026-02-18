@@ -16,12 +16,20 @@ def _ks_path():
 
 
 def is_active() -> bool:
-    """Return True if kill switch is currently enabled."""
+    """Return True if kill switch is currently enabled.
+
+    Fail-safe: if file is missing, auto-create it as disabled and return False.
+    This prevents bypass via file deletion while allowing first-run.
+    """
+    ks_path = _ks_path()
     try:
-        data = read_json(_ks_path())
+        data = read_json(ks_path)
         return data.get("enabled", False)
     except FileNotFoundError:
-        return False
+        # フェイルセーフ: ファイル不存在 = 状態不明 = 停止
+        # 初回起動時は daemon.sh が deactivate() を呼んで初期化する
+        logger.warning("kill_switch.json not found - defaulting to ACTIVE (failsafe)")
+        return True
 
 
 def activate(reason: str) -> None:

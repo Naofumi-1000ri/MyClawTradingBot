@@ -115,19 +115,21 @@ class TradeExecutor:
             logger.info("Skipping %s: action is hold", symbol)
             return None
 
-        # Risk validation (optional dependency)
+        # Risk validation
         try:
             from src.risk.risk_manager import RiskManager
             rm = RiskManager()
             positions = self.state.get_positions()
-            user_state = self.info.user_state(self.main_address)
-            equity = float(user_state.get("marginSummary", {}).get("accountValue", 0))
+            equity = self._get_equity()
             allowed, reason = rm.validate_signal(signal, positions, equity)
             if not allowed:
                 logger.warning("Risk rejected %s %s: %s", action, symbol, reason)
                 return {"symbol": symbol, "action": action, "status": "rejected", "reason": reason}
-        except (ImportError, Exception) as exc:
-            logger.debug("RiskManager not available, proceeding without risk check: %s", exc)
+        except ImportError:
+            logger.warning("RiskManager not available, skipping risk check")
+        except Exception as exc:
+            logger.error("RiskManager error: %s - rejecting signal for safety", exc)
+            return {"symbol": symbol, "action": action, "status": "rejected", "reason": f"risk check error: {exc}"}
 
         # Execute
         leverage = signal.get("leverage", self.default_leverage)
@@ -171,10 +173,16 @@ class TradeExecutor:
         resp = self.exchange.market_open(symbol, is_buy, size, px=None, slippage=0.01)
         logger.info("Order response: %s", resp)
 
-        status = "filled" if _is_order_success(resp) else "failed"
         fill_price = _extract_fill_price(resp)
+        if _is_order_success(resp) and fill_price > 0:
+            status = "filled"
+        elif _is_order_partial(resp):
+            status = "partial"
+            logger.warning("Partial fill for %s %s (order resting on book)", side, symbol)
+        else:
+            status = "failed"
 
-        if status == "filled":
+        if status in ("filled", "partial") and fill_price > 0:
             self.state.record_trade({
                 "symbol": symbol,
                 "side": side,
@@ -296,8 +304,10 @@ class TradeExecutor:
                 logger.error("Cannot get price for %s", symbol)
                 return None
 
-            # notional = equity * max_pct% * leverage, size = notional / price
-            notional = equity * (max_pct / 100.0) * leverage
+            # 証拠金 = equity × max_pct%、notional = 証拠金 × leverage
+            # (leverage を証拠金に掛けてnotionalを算出 — 証拠金はmax_pct%以内に制限)
+            margin = equity * (max_pct / 100.0)
+            notional = margin * leverage
             size = notional / price
 
             # Round to reasonable precision
@@ -315,18 +325,26 @@ class TradeExecutor:
 
 
 def _is_order_success(resp: dict) -> bool:
-    """Check if an exchange response indicates success."""
-    if not isinstance(resp, dict):
+    """Check if an exchange response indicates a fully filled order."""
+    if not isinstance(resp, dict) or resp.get("status") != "ok":
         return False
-    status = resp.get("status", "")
-    if status == "ok":
-        return True
-    # Check nested response
     response = resp.get("response", {})
     if isinstance(response, dict) and response.get("type") == "order":
         data = response.get("data", {})
         if isinstance(data, dict) and data.get("statuses"):
-            return any(s.get("filled") or s.get("resting") for s in data["statuses"])
+            return any(s.get("filled") for s in data["statuses"])
+    return False
+
+
+def _is_order_partial(resp: dict) -> bool:
+    """Check if an order is resting (partial fill or unfilled)."""
+    if not isinstance(resp, dict) or resp.get("status") != "ok":
+        return False
+    response = resp.get("response", {})
+    if isinstance(response, dict) and response.get("type") == "order":
+        data = response.get("data", {})
+        if isinstance(data, dict) and data.get("statuses"):
+            return any(s.get("resting") for s in data["statuses"])
     return False
 
 

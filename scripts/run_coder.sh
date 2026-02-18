@@ -109,11 +109,11 @@ if [ "$GIT_BEFORE" != "$GIT_AFTER" ] && [ "$GIT_BEFORE" != "no-git" ]; then
     echo "$DIFF_SUMMARY"
 
     # 禁止ファイルが変更されていないかチェック
-    FORBIDDEN=$(git diff --name-only "$GIT_BEFORE".."$GIT_AFTER" 2>/dev/null | grep -E "^(src/risk/|src/executor/trade_executor\.py|scripts/daemon\.sh|scripts/emergency_stop\.sh)" || true)
+    FORBIDDEN=$(git diff --name-only "$GIT_BEFORE".."$GIT_AFTER" 2>/dev/null | grep -E "^(src/risk/|src/executor/trade_executor\.py|scripts/daemon\.sh|scripts/emergency_stop\.sh|config/secrets|config/runtime\.env|config/risk_params\.yaml|\.git/)" || true)
     if [ -n "$FORBIDDEN" ]; then
         echo "[$TIMESTAMP] SECURITY: Forbidden files modified! Reverting."
         echo "Forbidden: $FORBIDDEN"
-        git revert --no-edit HEAD 2>/dev/null || true
+        git revert --no-edit HEAD 2>/dev/null || git reset --hard HEAD~1 2>/dev/null || true
         python3 -c "
 from src.monitor.telegram_notifier import send_message
 send_message('SECURITY: Coder modified forbidden files. Reverted.\\n$FORBIDDEN')

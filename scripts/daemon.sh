@@ -18,6 +18,12 @@ fi
 
 if [ -f ".venv/bin/activate" ]; then
     source .venv/bin/activate
+
+# Kill switch 初期化
+if [ ! -f "state/kill_switch.json" ]; then
+    python3 -c "from src.risk.kill_switch import deactivate; deactivate()" 2>/dev/null || true
+    echo "[daemon] kill_switch.json initialized"
+fi
 fi
 
 CYCLE=0

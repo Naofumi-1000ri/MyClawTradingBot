@@ -82,6 +82,31 @@ def _fetch_funding_rates(info: Info) -> dict[str, float]:
     return rates
 
 
+
+def _fetch_account_equity(info: Info, settings: dict) -> float:
+    """Fetch account equity. Supports both regular and unified (portfolio margin) accounts."""
+    import requests as _req
+    main_address = os.environ.get("HYPERLIQUID_MAIN_ADDRESS", "").strip()
+    if not main_address:
+        return 0.0
+    try:
+        # まず marginSummary を確認
+        state = info.user_state(main_address)
+        equity = float(state.get("marginSummary", {}).get("accountValue", 0))
+        if equity > 0:
+            return equity
+        # 統合口座: spot USDC を使用
+        base_url = get_hyperliquid_url(settings)
+        resp = _req.post(base_url + "/info",
+            json={"type": "spotClearinghouseState", "user": main_address}, timeout=5)
+        for b in resp.json().get("balances", []):
+            if b.get("coin") == "USDC":
+                return float(b.get("total", 0))
+    except Exception as e:
+        logger.warning("Failed to fetch equity: %s", e)
+    return 0.0
+
+
 def collect(settings: dict | None = None) -> dict:
     """Collect market data for all configured symbols.
 
@@ -164,9 +189,21 @@ def collect(settings: dict | None = None) -> dict:
             "funding_rate": fr,
         }
 
+    # Equity 取得 & daily_pnl 更新
+    equity = _fetch_account_equity(info, settings)
+    if equity > 0:
+        try:
+            from src.state.state_manager import StateManager
+            sm = StateManager()
+            sm.update_daily_pnl(equity)
+            logger.info("Equity updated: $%.2f", equity)
+        except Exception as e:
+            logger.warning("Failed to update daily_pnl: %s", e)
+
     result = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "symbols": symbols_data,
+        "account_equity": equity,
     }
 
     atomic_write_json(output_path, result)
