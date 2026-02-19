@@ -84,24 +84,44 @@ def _fetch_funding_rates(info: Info) -> dict[str, float]:
 
 
 def _fetch_account_equity(info: Info, settings: dict) -> float:
-    """Fetch account equity. Supports both regular and unified (portfolio margin) accounts."""
+    """Fetch account equity from Hyperliquid.
+
+    perps accountValue (marginSummary.accountValue) を正とする。
+    これにはマージン担保+未実現損益が含まれるため、最も信頼できる値。
+    spot USDC が perps 側に反映されていない場合のみ加算する。
+    """
     import requests as _req
     main_address = os.environ.get("HYPERLIQUID_MAIN_ADDRESS", "").strip()
     if not main_address:
         return 0.0
     try:
-        # まず marginSummary を確認
+        # Perps side — 最も信頼できるequity源
         state = info.user_state(main_address)
-        equity = float(state.get("marginSummary", {}).get("accountValue", 0))
-        if equity > 0:
-            return equity
-        # 統合口座: spot USDC を使用
+        perps_equity = float(state.get("marginSummary", {}).get("accountValue", 0))
+
+        # Spot side: USDC balance
+        spot_usdc = 0.0
         base_url = get_hyperliquid_url(settings)
         resp = _req.post(base_url + "/info",
             json={"type": "spotClearinghouseState", "user": main_address}, timeout=5)
         for b in resp.json().get("balances", []):
             if b.get("coin") == "USDC":
-                return float(b.get("total", 0))
+                spot_usdc = float(b.get("total", 0))
+                break
+
+        # perps accountValue を正とする。
+        # 統合口座: perps_equity に spot 担保が既に含まれている。
+        # 標準口座: perps_equity がそのまま口座価値。
+        # spot のみ(perps=0): spot_usdc を使用。
+        if perps_equity > 0:
+            total = perps_equity
+        else:
+            total = spot_usdc
+
+        if total > 0:
+            logger.debug("Equity: perps_av=%.2f, spot=%.2f, total=%.2f",
+                         perps_equity, spot_usdc, total)
+            return total
     except Exception as e:
         logger.warning("Failed to fetch equity: %s", e)
     return 0.0
@@ -189,7 +209,7 @@ def collect(settings: dict | None = None) -> dict:
             "funding_rate": fr,
         }
 
-    # Equity 取得 & daily_pnl 更新
+    # Equity 取得 & daily_pnl 更新 & ポジション同期
     equity = _fetch_account_equity(info, settings)
     if equity > 0:
         try:
@@ -199,6 +219,16 @@ def collect(settings: dict | None = None) -> dict:
             logger.info("Equity updated: $%.2f", equity)
         except Exception as e:
             logger.warning("Failed to update daily_pnl: %s", e)
+
+    # ポジション同期 (Hyperliquid API → positions.json)
+    main_address = os.environ.get("HYPERLIQUID_MAIN_ADDRESS", "").strip()
+    if main_address:
+        try:
+            from src.state.state_manager import StateManager
+            sm = StateManager()
+            sm.sync_positions(info, main_address)
+        except Exception as e:
+            logger.warning("Failed to sync positions: %s", e)
 
     result = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -210,6 +240,15 @@ def collect(settings: dict | None = None) -> dict:
     logger.info(
         "Market data saved: %d symbols -> %s", len(symbols_data), output_path
     )
+
+    # アーカイブ保存 (バックテスト用履歴蓄積)
+    try:
+        from src.hypothesis.archiver import archive_market_data, rotate_old
+        archive_market_data(settings)
+        rotate_old(settings)
+    except Exception as e:
+        logger.warning("Archive failed (non-critical): %s", e)
+
     return result
 
 
