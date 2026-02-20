@@ -96,9 +96,10 @@ def _trigger_agent_failure_alert(consecutive: int) -> None:
     entry = (
         f"\n## CRITICAL: agent_failure ({now.strftime('%Y-%m-%d %H:%M UTC')})\n\n"
         f"- **連続失敗サイクル数**: {consecutive}\n"
-        f"- **内容**: 全戦略 (BTC/ETH/SOL) がデータ不足によりスキャン不能\n"
+        f"- **内容**: 全戦略 (BTC/ETH/SOL) がスキャン不能"
+        f" (データ不足 / コンテキスト構築失敗 / ゴム戦略クラッシュのいずれか)\n"
         f"- **対処**: kill_switch.json に `warning=true` を設定済み\n"
-        f"- **要確認**: データ収集 (data_collector.py) / API接続を確認すること\n"
+        f"- **要確認**: データ収集 (data_collector.py) / API接続 / brain_consensus.py ログを確認すること\n"
     )
 
     try:
@@ -524,13 +525,21 @@ def main() -> None:
     except Exception as e:
         logger.error("Context build failed: %s", e)
         _write_fallback_and_exit(symbols, f"コンテキスト構築失敗: {e}")
+        # コンテキスト構築失敗も「全エージェント失敗」として計上
+        _track_agent_failure(failed=True)
         return
 
     _sanitize_equity_in_context(context)
 
     # 2. ゴム戦略 (BTC RubberWall + ETH RubberBand)
     logger.info("[2/2] Running rubber strategies...")
-    _run_rubber_wall(settings, context)
+    try:
+        _run_rubber_wall(settings, context)
+    except Exception as e:
+        logger.error("Rubber strategy crashed: %s", e)
+        _write_fallback_and_exit(symbols, f"ゴム戦略クラッシュ: {e}")
+        # ゴム戦略クラッシュも「全エージェント失敗」として計上
+        _track_agent_failure(failed=True)
 
 
 def _write_fallback_and_exit(symbols: list[str], reason: str) -> None:
