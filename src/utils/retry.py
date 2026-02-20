@@ -192,11 +192,13 @@ def enter_safe_hold(reason: str, notify: bool = True) -> None:
     import json
     from pathlib import Path
     from datetime import datetime, timezone
+    from src.utils.config_loader import get_project_root
 
+    ROOT = get_project_root()
     logger.critical("SAFE_HOLD: %s", reason)
 
     # signals.json を hold で上書き
-    signals_path = Path("signals/signals.json")
+    signals_path = ROOT / "signals" / "signals.json"
     signals_path.parent.mkdir(parents=True, exist_ok=True)
     hold_payload = {
         "action_type": "hold",
@@ -220,7 +222,7 @@ def enter_safe_hold(reason: str, notify: bool = True) -> None:
         logger.error("SAFE_HOLD: signals.json の書き込みに失敗: %s", e)
 
     # kill_switch.json に warning フラグを立てる
-    ks_path = Path("state/kill_switch.json")
+    ks_path = ROOT / "state" / "kill_switch.json"
     try:
         if ks_path.exists():
             ks = json.loads(ks_path.read_text(encoding="utf-8"))
