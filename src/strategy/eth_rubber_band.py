@@ -6,15 +6,23 @@ vol_ratio の強度帯で挙動が反転する ETH 固有の特性を利用。
 Pattern A (reversal):  高閾値 BEAR spike → LONG (平均回帰)
   - vol_ratio >= 7.0 の大スパイクはオーバーシュート → 戻る (旧 6.0 から引き上げ)
   - 30日バックテスト: deep (<-20%) + vol>=7x → 60%勝率 LONG。方向は正しい。
-  - 4Hレンジ下位40%では抑制 (4Hダウントレンド中の逆張りを回避。50%→40%に緩和)
+  - 4Hレンジ下位55%では抑制 (旧40%: 実運用でETH LONG 13件中7敗、ダウントレンド逆張りが主因)
   - TP = 固定 0.5%, SL = min(IN足low - 0.05%pad, entry * (1 - 0.25%))
   - SL最小距離を0.25%に拡大 (旧0.1%: ノイズでSLが頻発した問題を修正)
 
 Pattern B (momentum):  中閾値 BEAR spike + 上位ゾーン → SHORT
-  - vol_ratio 3.0-7.0 かつ 4Hレンジ position >= 40% (旧50%: 機会ゼロにより40%に緩和)
-  - 30日バックテスト: upper (40-100%) + vol>=5x → 31%勝率と低い。注意深くモニタリング要。
+  - vol_ratio 4.0-7.0 かつ 4Hレンジ position >= 55%
+    (旧: 3.0x/40%。実運用20件WR=45%/PF=0.77。SHORTのみPF黒字だがエントリー条件が甘すぎた)
+  - 30日バックテスト: upper (40-100%) + vol>=5x → 31%勝率と低い。条件引き締めで精度向上狙い。
   - TP = 時間カット 15bar (75分, 旧10bar=50分: 短期ノイズ吸収のため延長)
   - SL = IN足high + 0.05%pad, 最小距離0.30% (旧0.20%: ノイズ耐性向上)
+
+2026-02-21 最適化 (実運用20件分析):
+  - ETH LONG: 13件 6勝 PnL=-$0.72。下降トレンド中の逆張りが損失主因
+    → reversal_h4_filter_pct 40%→55% (4H中位以上でのみLONG許可)
+  - ETH SHORT: 7件 3勝 PnL=+$0.24 (黒字だが条件緩すぎ)
+    → momentum_threshold 3.0→4.0 (弱スパイクの誤シグナル排除)
+    → momentum_zone_min 40→55 (4H上位55%以上でのみSHORT)
 """
 
 from __future__ import annotations
@@ -30,10 +38,10 @@ _DEFAULT_CONFIG = {
     "reversal_tp_pct": 0.005,       # 旧0.4%→0.5%: SL拡大に合わせてR:R維持
     "reversal_sl_pad_pct": 0.0005,  # 0.05% pad below candle low
     "reversal_sl_min_dist": 0.0025, # 旧0.1%→0.25%: ノイズ耐性確保 (直近SL頻発問題修正)
-    "reversal_h4_filter_pct": 40,   # 4Hレンジ下位40%では反転LONG抑制 (50%→40%: 静観多発により緩和、下降トレンドでも強スパイク時はLONG有効)
+    "reversal_h4_filter_pct": 55,   # 旧40%→55%: 実運用ETH LONG 13件中7敗。下降トレンド逆張りを厳格排除
     # Pattern B: momentum
-    "momentum_threshold": 3.0,      # lower bound
-    "momentum_zone_min": 40,        # 旧50%→40%: 50%は機会ゼロ、40%に緩和してデータ収集
+    "momentum_threshold": 4.0,      # 旧3.0→4.0: 弱スパイク(3-4x)は誤シグナル多数。品質向上
+    "momentum_zone_min": 55,        # 旧40%→55%: 4H上位55%以上でのみSHORT (実運用での偽陽性削減)
     "momentum_cut_bars": 15,        # 旧10bar(50分)→15bar(75分): 短期ノイズ吸収のため延長
     "momentum_sl_pad_pct": 0.0005,  # 0.05% pad above candle high
     "momentum_sl_min_dist": 0.003,  # 旧0.20%→0.30%: SL最小距離拡大 (ノイズ耐性向上)
@@ -118,7 +126,7 @@ class EthRubberBand(BaseStrategy):
         if h4_pos < h4_filter_pct:
             logger.info(
                 "Pattern A: SKIP (4H pos=%.1f%% < filter=%d%%, 4H=[%.2f-%.2f], "
-                "4H下位ゾーン → ダウントレンド継続リスク高。filter=40%%: 旧50%%から緩和済み)",
+                "4H中位以下 → ダウントレンド逆張りリスク高。filter=55%%: 旧40%%から引き上げ・実運用LONG 7敗対策)",
                 h4_pos, h4_filter_pct, h4_low, h4_high,
             )
             return None, self._build_next_cache(idx)

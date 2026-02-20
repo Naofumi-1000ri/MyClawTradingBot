@@ -32,8 +32,8 @@ strategy:
     vol_window: 288
   sol_rubber_wall:               # SOL: BTC型ゴムの壁 (BEAR spike → SHORT メイン)
     symbol: "SOL"
-    vol_threshold: 5.0           # メインSHORT: 5x (SOLはスパイク頻度が低い)
-    deep_threshold: 7.0          # deep_below LONG: 7x+ 高閾値
+    vol_threshold: 6.5           # 旧5.0→6.5: 実運用28件WR=25%/PF=0.11。高品質スパイクに絞り品質向上
+    deep_threshold: 7.0          # deep_below LONG: 7x+ 高閾値 (deep_reversalは一時無効化中)
     h4_window: 48
     vol_window: 288
 
