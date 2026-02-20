@@ -922,7 +922,12 @@ def main() -> None:
     logger.info("[6/6] Merging signals...")
     positions = context.get("positions", [])
     min_conf = brain_config.get("min_confidence", settings.get("trading", {}).get("min_confidence", 0.7))
-    merged = merge_signals(t_output, f_output, r_output, symbols, positions, min_confidence=min_conf)
+    # 4Hトレンドフィルター用にraw market_dataを渡す
+    raw_market_data = {"symbols": context.get("market_data", {})}
+    merged = merge_signals(
+        t_output, f_output, r_output, symbols, positions,
+        min_confidence=min_conf, market_data=raw_market_data,
+    )
 
     # 8. 追加アドバイザー合議 (Macro + Execution/MM)
     advisor_cfg = brain_config.get("advisors", {})

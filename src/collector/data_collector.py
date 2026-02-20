@@ -19,6 +19,7 @@ logger = setup_logger("data_collector")
 
 # 各時間足のミリ秒
 _INTERVAL_MS = {
+    "5m":  5 * 60 * 1000,
     "15m": 15 * 60 * 1000,
     "1h":  60 * 60 * 1000,
     "4h":  4 * 60 * 60 * 1000,
@@ -26,9 +27,10 @@ _INTERVAL_MS = {
 
 # デフォルト取得本数
 _INTERVAL_DEFAULT_COUNT = {
+    "5m":  336,  # 288(24h) + 48(4hバッファ)
     "15m": 96,   # 24時間分
     "1h":  48,   # 2日分
-    "4h":  30,   # 5日分
+    "4h":  50,   # 8日分 (MACD(12,26,9)計算に35本必要なため余裕を持って50本)
 }
 
 
@@ -202,6 +204,14 @@ def collect(settings: dict | None = None) -> dict:
             if fr is not None:
                 logger.warning("Using previous funding_rate for %s", sym)
 
+        # 5m足追加取得 (ゴムの壁モデル + 将来のアルト分析用)
+        try:
+            candles["candles_5m"] = _fetch_candles(info, sym, "5m", 336)
+            logger.info("Fetched %d 5m candles for %s", len(candles["candles_5m"]), sym)
+        except Exception as e:
+            logger.error("Failed to fetch 5m candles for %s: %s", sym, e)
+            candles["candles_5m"] = prev_sym.get("candles_5m", [])
+
         symbols_data[sym] = {
             "mid_price": mid_price,
             **candles,
@@ -209,26 +219,30 @@ def collect(settings: dict | None = None) -> dict:
             "funding_rate": fr,
         }
 
-    # Equity 取得 & daily_pnl 更新 & ポジション同期
+    # Equity 取得 & ポジション同期 & daily_pnl 更新
     equity = _fetch_account_equity(info, settings)
-    if equity > 0:
-        try:
-            from src.state.state_manager import StateManager
-            sm = StateManager()
-            sm.update_daily_pnl(equity)
-            logger.info("Equity updated: $%.2f", equity)
-        except Exception as e:
-            logger.warning("Failed to update daily_pnl: %s", e)
-
-    # ポジション同期 (Hyperliquid API → positions.json)
+    sm = None
+    positions = []
+    # ポジション同期 (Hyperliquid API -> positions.json)
     main_address = os.environ.get("HYPERLIQUID_MAIN_ADDRESS", "").strip()
     if main_address:
         try:
             from src.state.state_manager import StateManager
             sm = StateManager()
-            sm.sync_positions(info, main_address)
+            positions = sm.sync_positions(info, main_address)
         except Exception as e:
             logger.warning("Failed to sync positions: %s", e)
+
+    if equity > 0:
+        try:
+            if sm is None:
+                from src.state.state_manager import StateManager
+                sm = StateManager()
+            api_unrealized = sum(float(p.get("unrealized_pnl", 0) or 0) for p in positions)
+            sm.update_daily_pnl(equity, api_unrealized_pnl=api_unrealized)
+            logger.info("Equity updated: $%.2f", equity)
+        except Exception as e:
+            logger.warning("Failed to update daily_pnl: %s", e)
 
     result = {
         "timestamp": datetime.now(timezone.utc).isoformat(),

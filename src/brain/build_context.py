@@ -10,9 +10,10 @@ from src.utils.file_lock import atomic_write_json, read_json
 # 時間足ごとにJSONコンテキストに含める本数
 # チャート画像で視覚情報は補完されるので数値は絞る
 _CANDLE_LIMITS = {
+    "candles_5m":  336,  # RubberWall用: 全量 (288+48)
     "candles_15m": 24,   # 6時間分 (直近の値動き詳細)
     "candles_1h":  24,   # 24時間分 (日足レベルの構造)
-    "candles_4h":  15,   # 60時間分 (週足レベルの構造)
+    "candles_4h":  50,   # 200時間分 (MACD(12,26,9)計算用に50本確保)
 }
 
 
@@ -96,6 +97,28 @@ def build_context() -> dict:
             "risk_alerts": review.get("risk_alerts", []),
             "reviewed_at": review.get("reviewed_at", ""),
         }
+
+    # Hypothesis Lab: 発火中の仮説をコンテキスト注入
+    try:
+        from src.hypothesis.manager import check_triggers
+        raw_market = read_json(root / "data" / "market_data.json")
+        triggered = check_triggers(raw_market)
+        if triggered:
+            hyp_config = settings.get("hypothesis", {})
+            bonus = hyp_config.get("proven_confidence_bonus", 0.05)
+            context["hypothesis_alerts"] = [
+                {
+                    "id": h["id"],
+                    "description": h["description"],
+                    "status": h["status"],
+                    "direction": h["prediction"]["direction"],
+                    "symbol": h["prediction"]["symbol"],
+                    "confidence_bonus": bonus if h["status"] == "proven" else 0.0,
+                }
+                for h in triggered
+            ]
+    except Exception:
+        pass  # 仮説システム未初期化でも動作に影響なし
 
     return context
 
