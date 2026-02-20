@@ -5,8 +5,8 @@ vol_ratio の強度帯で挙動が反転する ETH 固有の特性を利用。
 
 Pattern A (reversal):  高閾値 BEAR spike → LONG (平均回帰)
   - vol_ratio >= 7.0 の大スパイクはオーバーシュート → 戻る (旧 6.0 から引き上げ)
-  - 4Hレンジ下位40%では抑制 (4Hダウントレンド中の逆張りを回避)
-  - TP = 固定 0.5%, SL = max(IN足low - 0.05%pad, entry * (1 - 0.25%))
+  - 4Hレンジ下位50%では抑制 (4Hダウントレンド中の逆張りを回避。旧40%→50%に強化)
+  - TP = 固定 0.5%, SL = min(IN足low - 0.05%pad, entry * (1 - 0.25%))
   - SL最小距離を0.25%に拡大 (旧0.1%: ノイズでSLが頻発した問題を修正)
 
 Pattern B (momentum):  中閾値 BEAR spike + 上位ゾーン → SHORT
@@ -28,7 +28,7 @@ _DEFAULT_CONFIG = {
     "reversal_tp_pct": 0.005,       # 旧0.4%→0.5%: SL拡大に合わせてR:R維持
     "reversal_sl_pad_pct": 0.0005,  # 0.05% pad below candle low
     "reversal_sl_min_dist": 0.0025, # 旧0.1%→0.25%: ノイズ耐性確保 (直近SL頻発問題修正)
-    "reversal_h4_filter_pct": 40,   # 4Hレンジ下位40%では反転LONG抑制 (ダウントレンド中回避)
+    "reversal_h4_filter_pct": 50,   # 4Hレンジ下位50%では反転LONG抑制 (旧40%→50%: ダウントレンド中回避強化)
     # Pattern B: momentum
     "momentum_threshold": 3.0,      # lower bound
     "momentum_zone_min": 30,        # 4H position >= 30%
@@ -101,9 +101,9 @@ class EthRubberBand(BaseStrategy):
     ) -> tuple[dict | None, dict]:
         """Pattern A: 高閾値 BEAR spike → LONG reversal。
 
-        SL = max(candle low - 0.05%pad, entry * (1 - 0.25%))  ← 最小距離0.25%で頻発SL修正
+        SL = min(candle low - 0.05%pad, entry * (1 - 0.25%))  ← 最小距離0.25%で頻発SL修正
         TP = 固定 0.5%
-        4Hフィルター: 4Hレンジ下位40%では抑制 (ダウントレンド継続中の逆張り回避)
+        4Hフィルター: 4Hレンジ下位50%では抑制 (ダウントレンド継続中の逆張り回避。旧40%→50%)
         """
         h4_window = self.cfg["h4_window"]
         h4_filter_pct = self.cfg["reversal_h4_filter_pct"]
@@ -198,10 +198,11 @@ class EthRubberBand(BaseStrategy):
         entry = candle["c"]
 
         # SL = candle high に pad を加えた値
-        sl_price = round(candle["h"] * (1 + sl_pad), 2)
+        # 最低SL距離 0.2% を保証 (旧0.1%→0.2%: small candle highによる過接近SL防止)
+        sl_from_candle = round(candle["h"] * (1 + sl_pad), 2)
+        sl_from_min = round(entry * (1 + 0.002), 2)
+        sl_price = max(sl_from_candle, sl_from_min)
         sl_dist = (sl_price - entry) / entry
-        if sl_dist < 0.001:
-            sl_price = round(entry * (1 + 0.001), 2)
 
         # TP は時間カットなので設定しない (brain 側で管理)
         # trade_executor の R:R チェックを通すため形式的に遠い値を設定

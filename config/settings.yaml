@@ -22,7 +22,7 @@ strategy:
     reversal_tp_pct: 0.005       # Pattern A: TP 0.5% (旧0.4%→0.5%)
     reversal_sl_pad_pct: 0.0005  # Pattern A: SL = candle low - 0.05% pad
     reversal_sl_min_dist: 0.0025 # Pattern A: SL最小距離0.25% (旧0.1%→0.25%, ノイズSL修正)
-    reversal_h4_filter_pct: 40   # Pattern A: 4Hレンジ下位40%では抑制 (ダウントレンド回避)
+    reversal_h4_filter_pct: 50   # Pattern A: 4Hレンジ下位50%では抑制 (旧40%→50%: ダウントレンド回避強化)
     momentum_threshold: 3.0      # Pattern B: >= this & < reversal → SHORT
     momentum_zone_min: 30        # Pattern B: 4H position >= 30% のみ
     momentum_cut_bars: 10        # Pattern B: 50分 (10bar) で時間カット
