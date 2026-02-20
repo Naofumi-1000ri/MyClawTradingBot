@@ -10,9 +10,11 @@ Pattern A (reversal):  高閾値 BEAR spike → LONG (平均回帰)
   - SL最小距離を0.25%に拡大 (旧0.1%: ノイズでSLが頻発した問題を修正)
 
 Pattern B (momentum):  中閾値 BEAR spike + 上位ゾーン → SHORT
-  - vol_ratio 3.0-7.0 かつ 4Hレンジ position >= 30%
-  - TP = 時間カット 10bar (50分), SL = IN足high + 0.05%pad
-  - 56% win, PF 4.70, avg +0.47%/trade
+  - vol_ratio 3.0-7.0 かつ 4Hレンジ position >= 50% (旧30%→50%: 確度向上)
+  - TP = 時間カット 15bar (75分, 旧10bar=50分: 短期ノイズ吸収のため延長)
+  - SL = IN足high + 0.05%pad, 最小距離0.30% (旧0.20%: ノイズ耐性向上)
+  - 改善理由: 実運用で10bar内に決着がつかないケースが多発。4Hゾーン絞り込みで
+    エントリー精度を高め、SL拡大でスパイク否定ラインまでの幅を確保。
 """
 
 from __future__ import annotations
@@ -31,9 +33,10 @@ _DEFAULT_CONFIG = {
     "reversal_h4_filter_pct": 50,   # 4Hレンジ下位50%では反転LONG抑制 (旧40%→50%: ダウントレンド中回避強化)
     # Pattern B: momentum
     "momentum_threshold": 3.0,      # lower bound
-    "momentum_zone_min": 30,        # 4H position >= 30%
-    "momentum_cut_bars": 10,        # 50分で時間カット
+    "momentum_zone_min": 50,        # 旧30%→50%: 4H上位50%以上に絞り込み (確度向上)
+    "momentum_cut_bars": 15,        # 旧10bar(50分)→15bar(75分): 短期ノイズ吸収のため延長
     "momentum_sl_pad_pct": 0.0005,  # 0.05% pad above candle high
+    "momentum_sl_min_dist": 0.003,  # 旧0.20%→0.30%: SL最小距離拡大 (ノイズ耐性向上)
     # shared
     "h4_window": 48,
     "vol_window": 288,
@@ -173,8 +176,9 @@ class EthRubberBand(BaseStrategy):
     ) -> tuple[dict | None, dict]:
         """Pattern B: 中閾値 BEAR spike + 上位ゾーン → SHORT momentum。
 
-        SL = IN足high + 0.05% pad (スパイク否定ライン)
-        TP = 時間カット 10bar (50分後にclose決済)
+        SL = IN足high + 0.05% pad (スパイク否定ライン), 最小距離0.30%
+        TP = 時間カット 15bar (75分後にclose決済, 旧10bar=50分から延長)
+        4Hゾーン: position >= 50% (旧30%→50%: 確度向上)
         """
         h4_window = self.cfg["h4_window"]
         zone_min = self.cfg["momentum_zone_min"]
@@ -194,13 +198,14 @@ class EthRubberBand(BaseStrategy):
             return None, next_cache
 
         sl_pad = self.cfg["momentum_sl_pad_pct"]
+        sl_min_dist = self.cfg.get("momentum_sl_min_dist", 0.003)
         cut_bars = self.cfg["momentum_cut_bars"]
         entry = candle["c"]
 
         # SL = candle high に pad を加えた値
-        # 最低SL距離 0.2% を保証 (旧0.1%→0.2%: small candle highによる過接近SL防止)
+        # 最低SL距離 0.30% を保証 (旧0.20%→0.30%: ノイズ耐性向上)
         sl_from_candle = round(candle["h"] * (1 + sl_pad), 2)
-        sl_from_min = round(entry * (1 + 0.002), 2)
+        sl_from_min = round(entry * (1 + sl_min_dist), 2)
         sl_price = max(sl_from_candle, sl_from_min)
         sl_dist = (sl_price - entry) / entry
 
@@ -220,7 +225,7 @@ class EthRubberBand(BaseStrategy):
             "reasoning": (
                 f"EthRubberBand B: momentum, vol_ratio={ratio:.1f}x, "
                 f"pos={pos:.1f}%, 4H=[{h4_low:.2f}-{h4_high:.2f}], "
-                f"→ SHORT {cut_bars}bar cut, SL=candle_high"
+                f"→ SHORT {cut_bars}bar cut, SL=candle_high+{sl_dist*100:.2f}%"
             ),
             "zone": "momentum",
             "pattern": "B_momentum",
@@ -231,8 +236,8 @@ class EthRubberBand(BaseStrategy):
             "spike_time": candle["t"],
         }
         logger.info(
-            "Signal: short ETH @ %.2f, SL=%.2f, exit=%dbar (momentum, candle-SL)",
-            entry, sl_price, cut_bars,
+            "Signal: short ETH @ %.2f, SL=%.2f (sl_dist=%.2f%%), exit=%dbar (momentum)",
+            entry, sl_price, sl_dist * 100, cut_bars,
         )
         return signal, next_cache
 
