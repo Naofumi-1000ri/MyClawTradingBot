@@ -263,6 +263,13 @@ def _run_rubber_wall(settings: dict, context: dict) -> bool:
     signals_list = []
 
     # --- BTC RubberWall ---
+    # 1) 既存ポジションの exit 監視 (SL/TP)
+    btc_exit_signals = _check_rubber_exits("BTC", context)
+    signals_list.extend(btc_exit_signals)
+
+    # 2) 新規シグナルスキャン
+    has_btc_pos = _has_rubber_position("BTC")
+
     rw_config = strategy_cfg.get("rubber_wall", {})
     btc_5m = context.get("market_data", {}).get("BTC", {}).get("candles_5m", [])
 
@@ -282,10 +289,17 @@ def _run_rubber_wall(settings: dict, context: dict) -> bool:
             atomic_write_json(cache_path, btc_next_cache)
 
         if btc_signal:
-            signals_list.append(btc_signal)
-            _log_rubber_signal(btc_signal)
-            logger.info("RubberWall BTC: %s (zone=%s, vr=%.1f)",
-                        btc_signal["direction"], btc_signal.get("zone"), btc_signal.get("vol_ratio"))
+            if has_btc_pos:
+                logger.info("RubberWall BTC: signal %s but position already open, skip",
+                            btc_signal.get("zone"))
+            elif btc_exit_signals:
+                logger.info("RubberWall BTC: signal %s but exit in progress, skip",
+                            btc_signal.get("zone"))
+            else:
+                signals_list.append(btc_signal)
+                _log_rubber_signal(btc_signal)
+                logger.info("RubberWall BTC: %s (zone=%s, vr=%.1f)",
+                            btc_signal["direction"], btc_signal.get("zone"), btc_signal.get("vol_ratio"))
         else:
             logger.info("RubberWall BTC: no spike → hold")
     else:
