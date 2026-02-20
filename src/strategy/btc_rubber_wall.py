@@ -10,8 +10,14 @@
   貫通    (-20% ~ 0%):   LONG   TP 0.3%  SL 0.6% (30日分 vol>=5x: LONG_wr=55%, PF=2.33)
   レンジ上  (40% ~):       SHORT  TP 0.5%  SL 0.6% (30日分 vol>=5x: SHORT_wr=59%, EV=+0.049%)
   深突破   (~ -20%):      SKIP   (LONG/SHORT 双方 30-40%。エッジ不明確のためSKIP)
-  底付近   (0% ~ 20%):    SKIP   (SHORT_wr=55%だが現価格がレンジ底近傍でリスク高)
+  底付近   (0% ~ 20%):    SHORT  TP 0.4%  SL 0.5%  vol>=7.0のみ (SHORT_wr=55%。強スパイクは続落シグナル)
   中間     (20% ~ 40%):   SKIP   (ゾーン下寄りでSHORT期待値が不明確。旧20~40%は廃止)
+
+2026-02-21 bottomゾーン追加:
+  - 旧SKIP (SHORT_wr=55%だが現価格がレンジ底近傍でリスク高) から変更
+  - vol>=7.0xの強スパイク限定 (vol>=5xより厳格)。強い売り勢いは底割れ示唆
+  - TP 0.4%/SL 0.5% で小さめ設定 (底近傍のため利幅控えめ)
+  - 静観多発の改善: bottomゾーンで多くの機会を逃していた問題に対処
 
 2026-02-21 vol_threshold 7.0→5.0 変更:
   - 30日分バックテスト: vol>=5.0 BEAR spike のうち upper ゾーンで 59%勝率
@@ -57,7 +63,11 @@ _DEFAULT_CONFIG = {
         "upper_range": {"range": [40, 999], "direction": "short", "tp_pct": 0.005, "sl_pct": 0.006},
         # deep_reversal: SKIP (旧LONG: 30-40%勝率でエッジ不明確)
         # "deep_reversal": {"range": [-999, -20], "direction": "long", "tp_pct": 0.003},
-        # bottom (0~20): SKIP (SHORT_wr=55%だが現位置がレンジ底近傍でリスク高)
+        # bottom (0~20): SHORT (vol>=7.0xの強スパイク限定)
+        # 30日BT SHORT_wr=55%。強いBEARスパイクは底割れ → 続落シグナル
+        # TP 0.4%/SL 0.5% (底近傍のため利幅控えめ、SLはタイト)
+        # vol_min_override=7.0で通常閾値(5.0)より高い品質要求
+        "bottom": {"range": [0, 20], "direction": "short", "tp_pct": 0.004, "sl_pct": 0.005, "vol_min_override": 7.0},
         # middle (20~40): SKIP (上昇中間帯でSHORT期待値不明確)
     },
 }
@@ -146,7 +156,17 @@ class BtcRubberWall(BaseStrategy):
         next_cache = self._build_next_cache(idx)
 
         if matched_zone is None:
-            logger.info("Position %.1f%% falls in skip zone (bottom 0-20%%)", pos)
+            logger.info("Position %.1f%% falls in skip zone (middle 20-40%%)", pos)
+            return None, next_cache
+
+        # ゾーン固有の最低vol閾値チェック (vol_min_override)
+        # 例: bottomゾーンは vol>=7.0 のみ (通常5.0より高品質スパイク要求)
+        vol_min = matched_cfg.get("vol_min_override")
+        if vol_min is not None and ratio < vol_min:
+            logger.info(
+                "Position %.1f%% (%s zone): vol_ratio=%.1f < zone_min=%.1f, skip",
+                pos, matched_zone, ratio, vol_min,
+            )
             return None, next_cache
 
         direction = matched_cfg["direction"]
