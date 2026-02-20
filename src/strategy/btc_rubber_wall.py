@@ -8,10 +8,20 @@
 
 ゾーン:
   貫通    (-20% ~ 0%):   LONG   TP 0.3%  SL 0.6% (30日分 vol>=5x: LONG_wr=55%, PF=2.33)
+                          exit_bars=12 (60分タイムアウト。legacyで36時間漂流した教訓)
   レンジ上  (40% ~):       SHORT  TP 0.5%  SL 0.6% (30日分 vol>=5x: SHORT_wr=59%, EV=+0.049%)
+                          exit_bars=10 (50分タイムアウト。モメンタム系は長期保有不要)
   深突破   (~ -20%):      SKIP   (LONG/SHORT 双方 30-40%。エッジ不明確のためSKIP)
-  底付近   (0% ~ 20%):    SHORT  TP 0.4%  SL 0.5%  vol>=7.0のみ (SHORT_wr=55%。強スパイクは続落シグナル)
+  底付近   (0% ~ 20%):    SHORT  TP 0.4%  SL 0.6%  vol>=7.0のみ (SHORT_wr=55%。BTCノイズ幅0.3-0.5%に対してSL0.5%は狭すぎた)
+                          exit_bars=8 (40分タイムアウト。底付近は短期勝負)
   中間     (20% ~ 40%):   SKIP   (ゾーン下寄りでSHORT期待値が不明確。旧20~40%は廃止)
+
+2026-02-21 exit_bars追加:
+  - penetration LONG: legacy BTCが36時間漂流→SLヒット -$0.24 の教訓
+    12bar=60分: 1時間以内に反転しなければ環境変化とみなしクローズ
+  - upper_range SHORT: モメンタム系は短命。10bar=50分で期待値実現できなければ手仕舞い
+  - bottom SHORT: exit_bars=8で40分タイムアウト (底付近は特に短期判断要)
+  - bottom SL 0.5%→0.6%: BTCの5分足ノイズ0.3-0.5%に対して0.5%SLは狭すぎた
 
 2026-02-21 bottomゾーン追加:
   - 旧SKIP (SHORT_wr=55%だが現価格がレンジ底近傍でリスク高) から変更
@@ -55,19 +65,22 @@ _DEFAULT_CONFIG = {
         # penetration: LONG変更 (旧SHORT)
         # 30日BT BEAR spike>=5x: LONG_wr=55%, TP0.3%/SL0.6%でPF=2.33
         # BEARスパイク + 4Hレンジ下抜けは売り過剰 → 反転LONG
-        "penetration": {"range": [-20, 0], "direction": "long", "tp_pct": 0.003, "sl_pct": 0.006},
+        # exit_bars=12: 60分タイムアウト。legacyで36時間漂流→SLヒット -$0.24 の教訓
+        "penetration": {"range": [-20, 0], "direction": "long", "tp_pct": 0.003, "sl_pct": 0.006, "exit_bars": 12},
         # upper_range: SHORT (pos>=40%のみ)
         # 30日BT BEAR spike>=5x: SHORT_wr=59%, avg=-0.321%
         # TP 0.3%→0.5%: 旧EV=-0.069%→新EV=+0.049% (WR=59%前提)
         # ゾーン開始 20%→40%: 中位ゾーン(20-40%)はSHORT期待値不明確なためSKIP
-        "upper_range": {"range": [40, 999], "direction": "short", "tp_pct": 0.005, "sl_pct": 0.006},
+        # exit_bars=10: 50分タイムアウト。モメンタム系は短期間で結果が出なければ撤退
+        "upper_range": {"range": [40, 999], "direction": "short", "tp_pct": 0.005, "sl_pct": 0.006, "exit_bars": 10},
         # deep_reversal: SKIP (旧LONG: 30-40%勝率でエッジ不明確)
         # "deep_reversal": {"range": [-999, -20], "direction": "long", "tp_pct": 0.003},
         # bottom (0~20): SHORT (vol>=7.0xの強スパイク限定)
         # 30日BT SHORT_wr=55%。強いBEARスパイクは底割れ → 続落シグナル
-        # TP 0.4%/SL 0.5% (底近傍のため利幅控えめ、SLはタイト)
+        # TP 0.4%/SL 0.6% (底近傍のため利幅控えめ。旧SL=0.5%はBTCノイズ幅0.3-0.5%に狭すぎた)
+        # exit_bars=8: 40分タイムアウト。底付近は特に短期勝負
         # vol_min_override=7.0で通常閾値(5.0)より高い品質要求
-        "bottom": {"range": [0, 20], "direction": "short", "tp_pct": 0.004, "sl_pct": 0.005, "vol_min_override": 7.0},
+        "bottom": {"range": [0, 20], "direction": "short", "tp_pct": 0.004, "sl_pct": 0.006, "vol_min_override": 7.0, "exit_bars": 8},
         # middle (20~40): SKIP (上昇中間帯でSHORT期待値不明確)
     },
 }
@@ -183,6 +196,10 @@ class BtcRubberWall(BaseStrategy):
             tp_price = entry_price * (1 + tp_pct)
             sl_price = entry_price * (1 - sl_pct)
 
+        # タイムアウト設定 (ゾーンごと)
+        exit_bars = matched_cfg.get("exit_bars")
+        exit_mode = "time_cut" if exit_bars is not None else "tp_sl"
+
         signal = {
             "symbol": "BTC",
             "action": direction,
@@ -197,12 +214,16 @@ class BtcRubberWall(BaseStrategy):
                 f"vol_ratio={ratio:.1f}x, "
                 f"4H=[{h4_low:.2f}-{h4_high:.2f}], "
                 f"→ {direction} TP {tp_pct*100:.1f}% SL {sl_pct*100:.1f}%"
+                + (f" timeout={exit_bars}bar" if exit_bars else "")
             ),
             "zone": matched_zone,
             "range_position": round(pos, 1),
             "vol_ratio": round(ratio, 1),
             "spike_time": candle["t"],
+            "exit_mode": exit_mode,
         }
+        if exit_bars is not None:
+            signal["exit_bars"] = exit_bars
 
         logger.info("Signal: %s %s @ %.2f, TP=%.2f, SL=%.2f (zone=%s)",
                      direction, "BTC", entry_price, tp_price, sl_price, matched_zone)
