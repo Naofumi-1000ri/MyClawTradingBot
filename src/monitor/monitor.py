@@ -89,14 +89,23 @@ def run_monitor() -> None:
         unrealized = float(daily_pnl.get("unrealized_pnl", 0))
         total = realized + unrealized
         logger.info("Daily P&L: realized=%.2f unrealized=%.2f total=%.2f", realized, unrealized, total)
-        if total < 0:
-            alerts.append(f"Daily P&L negative: {total:.2f}")
+        equity = float(daily_pnl.get("equity", 0))
+        if total < 0 and equity > 0 and abs(total) / equity >= 0.01:
+            alerts.append(f"Daily P&L negative: {total:.2f} ({abs(total)/equity*100:.1f}%)")
 
     # 4. Check kill switch
     ks = _read_safe(state_dir / "kill_switch.json")
     if ks.get("enabled"):
         reason = ks.get("reason", "unknown")
         msg = f"KILL SWITCH ACTIVE: {reason}"
+        logger.warning(msg)
+        alerts.append(msg)
+
+    # 4a. Check agent failure warning
+    if ks.get("warning"):
+        warning_reason = ks.get("warning_reason", "unknown")
+        warning_at = ks.get("warning_at", "")
+        msg = f"WARNING: {warning_reason} (at: {warning_at})"
         logger.warning(msg)
         alerts.append(msg)
 
@@ -107,23 +116,32 @@ def run_monitor() -> None:
             from src.risk.risk_manager import RiskManager
             from src.risk.kill_switch import activate as ks_activate, is_active as ks_is_active
             if not ks_is_active():
-                rm = RiskManager()
+                # サニティチェック: equity が start_of_day_equity の10%未満は異常値
                 equity = float(daily_pnl.get("equity", 0))
-                peak_equity = float(daily_pnl.get("peak_equity", equity))
-                if rm.check_daily_loss(daily_pnl, equity):
-                    ks_activate("daily_loss_5pct_exceeded")
-                    _close_all_positions()
-                    msg = "KILL SWITCH: 日次損失5%超過"
-                    logger.critical(msg)
-                    alerts.append(msg)
-                    send_message(f"*KILL SWITCH* {msg}")
-                elif rm.check_max_drawdown(equity, peak_equity):
-                    ks_activate("max_drawdown_15pct_exceeded")
-                    _close_all_positions()
-                    msg = "KILL SWITCH: 最大DD15%超過"
-                    logger.critical(msg)
-                    alerts.append(msg)
-                    send_message(f"*KILL SWITCH* {msg}")
+                start_equity = float(daily_pnl.get("start_of_day_equity", equity))
+                if start_equity > 0 and equity < start_equity * 0.1:
+                    logger.warning(
+                        "Equity sanity check FAILED: equity=%.2f vs start=%.2f (%.1f%%). "
+                        "Likely stale or incorrect equity data. Skipping risk checks.",
+                        equity, start_equity, (equity / start_equity) * 100
+                    )
+                else:
+                    rm = RiskManager()
+                    peak_equity = float(daily_pnl.get("peak_equity", equity))
+                    if rm.check_daily_loss(daily_pnl, equity):
+                        ks_activate("daily_loss_5pct_exceeded")
+                        _close_all_positions()
+                        msg = "KILL SWITCH: 日次損失5%超過"
+                        logger.critical(msg)
+                        alerts.append(msg)
+                        send_message(f"*KILL SWITCH* {msg}")
+                    elif rm.check_max_drawdown(equity, peak_equity):
+                        ks_activate("max_drawdown_15pct_exceeded")
+                        _close_all_positions()
+                        msg = "KILL SWITCH: 最大DD15%超過"
+                        logger.critical(msg)
+                        alerts.append(msg)
+                        send_message(f"*KILL SWITCH* {msg}")
         except Exception:
             logger.exception("Risk limit check failed")
 
