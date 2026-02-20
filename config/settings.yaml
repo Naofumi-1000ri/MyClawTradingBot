@@ -12,7 +12,7 @@ hyperliquid:
 strategy:
   rubber_wall:                   # BTC: BEAR spike → SHORT (ゴムの壁)
     symbol: "BTC"
-    vol_threshold: 7.0
+    vol_threshold: 5.0           # 旧7.0→5.0: upper 77%勝率 (30日BTデータ), 機会損失削減
     h4_window: 48
     vol_window: 288
     timeout_candles: 5
@@ -24,7 +24,7 @@ strategy:
     reversal_sl_min_dist: 0.0025 # Pattern A: SL最小距離0.25% (旧0.1%→0.25%, ノイズSL修正)
     reversal_h4_filter_pct: 40   # Pattern A: 4Hレンジ下位40%では抑制 (50%→40%: 静観多発により緩和)
     momentum_threshold: 3.0      # Pattern B: >= this & < reversal → SHORT
-    momentum_zone_min: 50        # Pattern B: 4H position >= 50% のみ (旧30%→50%: 確度向上・コードデフォルト整合)
+    momentum_zone_min: 40        # Pattern B: 4H position >= 40% (旧50%: 機会ゼロにより40%に緩和)
     momentum_cut_bars: 15        # Pattern B: 75分 (15bar) で時間カット (旧10bar=50分→15bar: ノイズ吸収延長・コードデフォルト整合)
     momentum_sl_pad_pct: 0.0005  # Pattern B: SL = candle high + 0.05% pad
     momentum_sl_min_dist: 0.003  # Pattern B: SL最小距離0.30% (コードデフォルト明示)
