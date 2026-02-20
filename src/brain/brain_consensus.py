@@ -342,15 +342,20 @@ def _run_rubber_wall(settings: dict, context: dict) -> bool:
 
     sol_rw_config = strategy_cfg.get("sol_rubber_wall", {})
     sol_5m = context.get("market_data", {}).get("SOL", {}).get("candles_5m", [])
+    sol_funding_rate = context.get("market_data", {}).get("SOL", {}).get("funding_rate", 0.0)
 
     if sol_5m:
         cache_path = STATE_DIR / "sol_rubber_wall_cache.json"
         cache = _load_json_safe(cache_path)
 
-        logger.info("RubberWall SOL: scanning %d 5m candles (cache=%s)",
-                     len(sol_5m), "hit" if cache else "cold")
+        # funding_rate をconfigに注入してSolRubberWall側でフィルタリング可能にする
+        sol_rw_config_with_funding = dict(sol_rw_config)
+        sol_rw_config_with_funding["current_funding_rate"] = sol_funding_rate
 
-        sol_signal, sol_next_cache = SolRubberWall(sol_5m, sol_rw_config).scan(cache)
+        logger.info("RubberWall SOL: scanning %d 5m candles (cache=%s, funding=%.2e)",
+                     len(sol_5m), "hit" if cache else "cold", sol_funding_rate)
+
+        sol_signal, sol_next_cache = SolRubberWall(sol_5m, sol_rw_config_with_funding).scan(cache)
 
         if sol_next_cache:
             atomic_write_json(cache_path, sol_next_cache)
