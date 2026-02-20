@@ -244,11 +244,14 @@ def _has_eth_rubber_position() -> bool:
     return _has_rubber_position("ETH")
 
 
-def _run_rubber_wall(settings: dict, context: dict) -> None:
+def _run_rubber_wall(settings: dict, context: dict) -> bool:
     """ゴム戦略実行。BTC RubberWall + ETH RubberBand + SOL RubberWall を並列スキャン。
 
     閾値キャッシュ方式: 前サイクルで次の足の閾値volumeを事前計算済み。
     キャッシュヒット時は O(1) で判定完了。
+
+    Returns:
+        True=スキャン完全失敗 (全銘柄データ不足), False=少なくとも1銘柄スキャン完了。
     """
     from src.strategy.btc_rubber_wall import BtcRubberWall
     from src.strategy.eth_rubber_band import EthRubberBand
@@ -260,6 +263,9 @@ def _run_rubber_wall(settings: dict, context: dict) -> None:
     # --- BTC RubberWall ---
     rw_config = strategy_cfg.get("rubber_wall", {})
     btc_5m = context.get("market_data", {}).get("BTC", {}).get("candles_5m", [])
+
+    # スキャン失敗カウント (データ不足で戦略を実行できなかった銘柄数)
+    scan_failed_count = 0
 
     if btc_5m:
         cache_path = STATE_DIR / "rubber_wall_cache.json"
@@ -282,6 +288,7 @@ def _run_rubber_wall(settings: dict, context: dict) -> None:
             logger.info("RubberWall BTC: no spike → hold")
     else:
         logger.warning("No BTC 5m candles available")
+        scan_failed_count += 1
 
     # --- ETH RubberBand ---
     # 1) 既存ポジションの exit 監視 (SL/TP/時間カット)
@@ -323,6 +330,7 @@ def _run_rubber_wall(settings: dict, context: dict) -> None:
             logger.info("RubberBand ETH: no spike → hold")
     else:
         logger.warning("No ETH 5m candles available")
+        scan_failed_count += 1
 
     # --- SOL RubberWall ---
     # 1) 既存ポジションの exit 監視
@@ -364,6 +372,7 @@ def _run_rubber_wall(settings: dict, context: dict) -> None:
             logger.info("RubberWall SOL: no spike → hold")
     else:
         logger.warning("No SOL 5m candles available")
+        scan_failed_count += 1
 
     # --- 統合出力 ---
     if signals_list:
@@ -374,13 +383,16 @@ def _run_rubber_wall(settings: dict, context: dict) -> None:
 
     SIGNALS_DIR.mkdir(parents=True, exist_ok=True)
     atomic_write_json(SIGNALS_DIR / "signals.json", merged)
-    logger.info("=== Rubber Complete: action_type=%s, signals=%d ===",
-                merged.get("action_type"), len(signals_list))
+    logger.info("=== Rubber Complete: action_type=%s, signals=%d, scan_failed=%d/3 ===",
+                merged.get("action_type"), len(signals_list), scan_failed_count)
 
     # --- 連続失敗追跡 ---
-    # 全シンボルのキャンドルデータが揃わない場合を「スキャン失敗」と判定
-    all_scan_failed = (not btc_5m) and (not eth_5m) and (not sol_5m)
-    _track_agent_failure(all_scan_failed)
+    # 全3銘柄のキャンドルデータが揃わない場合を「スキャン完全失敗」と判定
+    # (部分的なデータ欠損は警告のみ、全滅時だけカウント)
+    all_scan_failed = (scan_failed_count >= 3)
+    if scan_failed_count > 0:
+        logger.warning("agent_failure: %d/3 symbols had no candle data this cycle", scan_failed_count)
+    return all_scan_failed
 
 
 def _signals_to_merged(signals: list[dict]) -> dict:
@@ -552,7 +564,7 @@ def main() -> None:
     # 2. ゴム戦略 (BTC RubberWall + ETH RubberBand) (最大2回リトライ: 計3回試行)
     logger.info("[2/2] Running rubber strategies (with retry)...")
     try:
-        call_with_retry(
+        all_scan_failed: bool = call_with_retry(
             _run_rubber_wall,
             args=(settings, context),
             max_retries=2,
@@ -561,6 +573,8 @@ def main() -> None:
             max_delay=15.0,
             operation_name="ゴム戦略",
         )
+        # 正常完了: 戻り値で失敗/成功を判定
+        _track_agent_failure(failed=all_scan_failed)
     except RetryExhausted as e:
         logger.error("Rubber strategy exhausted retries: %s", e)
         _write_fallback_and_exit(symbols, f"ゴム戦略クラッシュ (リトライ上限超過): {e.last_error}")
