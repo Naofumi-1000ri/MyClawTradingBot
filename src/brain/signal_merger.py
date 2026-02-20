@@ -9,7 +9,14 @@
 4Hトレンドフィルター (部分合議F単独long限定):
 - 4H EMA9 < EMA21 かつ MACD_histogram < 0 → F単独longをhold強制
 - 完全合議(T+F両方long)はフィルター対象外
+
+最低保有時間ルール:
+- エントリーから2サイクル（約10分）以内のcloseは、
+  RエージェントがCRITICAL close信号 (confidence >= 0.90) を出した場合のみ許可
+- それ以外はholdに変換してエントリー直後のchurnを防止
 """
+
+from datetime import datetime, timezone
 
 from src.utils.logger import setup_logger
 
@@ -107,6 +114,71 @@ def _build_hold_signal(symbol: str, reasoning: str) -> dict:
     }
 
 
+_MIN_HOLD_CYCLES = 2          # エントリーから何サイクル保有を最低限要求するか
+_CYCLE_MINUTES = 5            # 1サイクルの所要時間（分）
+_MIN_HOLD_MINUTES = _MIN_HOLD_CYCLES * _CYCLE_MINUTES  # = 10分
+_R_CRITICAL_CLOSE_CONF = 0.90  # 最低保有時間内にcloseを許可するR信号の最低confidence
+
+
+def _get_position_opened_at(
+    positions: list | None,
+    symbol: str,
+    trade_history: list | None = None,
+) -> datetime | None:
+    """ポジションのエントリー時刻を返す。
+
+    優先度:
+    1. positions.json の opened_at（trade_executorがエントリー後にsync前に設定する場合）
+    2. trade_history.json の最新 opened_at（closed_atがない = オープン中の最終エントリー）
+    いずれも取得できない場合はNone → 最低保有時間チェックをスキップ（安全側）。
+    """
+    # 1. positions から opened_at を試みる
+    if positions:
+        for pos in positions:
+            if pos.get("symbol") == symbol:
+                opened_at = pos.get("opened_at")
+                if opened_at:
+                    try:
+                        dt = datetime.fromisoformat(opened_at)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        return dt
+                    except ValueError:
+                        break  # パース失敗は trade_history にフォールバック
+
+    # 2. trade_history から最新のオープン中エントリーを探す
+    if trade_history:
+        latest_entry: datetime | None = None
+        for trade in reversed(trade_history):
+            if trade.get("symbol") != symbol:
+                continue
+            if trade.get("closed_at"):
+                # クローズ済みトレードはスキップ。最新のオープン中エントリーを探す
+                continue
+            ts = trade.get("opened_at") or trade.get("recorded_at")
+            if ts:
+                try:
+                    dt = datetime.fromisoformat(ts)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    if latest_entry is None or dt > latest_entry:
+                        latest_entry = dt
+                except ValueError:
+                    continue
+        if latest_entry:
+            return latest_entry
+
+    return None
+
+
+def _is_within_min_hold_period(opened_at: datetime | None) -> bool:
+    """エントリーから最低保有時間内かどうかを判定する。"""
+    if opened_at is None:
+        return False
+    elapsed_min = (datetime.now(timezone.utc) - opened_at).total_seconds() / 60.0
+    return elapsed_min < _MIN_HOLD_MINUTES
+
+
 def merge_signals(
     technician_output: dict,
     flow_output: dict,
@@ -115,6 +187,7 @@ def merge_signals(
     positions: list | None = None,
     min_confidence: float = 0.7,
     market_data: dict | None = None,
+    trade_history: list | None = None,
 ) -> dict:
     """3エージェントの出力を合議して最終signal_schema.json互換の出力を生成。
 
@@ -123,8 +196,9 @@ def merge_signals(
         flow_output: Agent F の出力 (flow_schema)
         risk_output: Agent R の出力 (risk_schema)
         symbols: 対象銘柄リスト
-        positions: 現在ポジション (決済判断用)
+        positions: 現在ポジション (決済判断用・最低保有時間チェック用)
         market_data: 市場データ (4Hトレンドフィルター用、省略可)
+        trade_history: トレード履歴 (最低保有時間チェック用、省略可)
 
     Returns:
         signal_schema.json 互換の dict
@@ -163,7 +237,7 @@ def merge_signals(
         r_verdict = r_decision.get("verdict", "reject") if r_decision else "reject"
         r_action = r_decision.get("final_action", "hold") if r_decision else "hold"
 
-        # --- 決済判断 (OUT = 寛容) ---
+        # --- 決済判断 (OUT = 寛容、ただし最低保有時間ルールあり) ---
         any_close = (t_action == "close" or f_action == "close" or r_action == "close")
         if any_close:
             reasoning_parts = []
@@ -173,6 +247,44 @@ def merge_signals(
                 reasoning_parts.append(f"F:close({f_sig.get('reasoning', '')})")
             if r_action == "close":
                 reasoning_parts.append(f"R:close({r_decision.get('reasoning', '')})")
+
+            # --- 最低保有時間ルール ---
+            # エントリーから2サイクル（10分）以内は、R critical close (conf>=0.90) のみ許可
+            opened_at = _get_position_opened_at(positions, symbol, trade_history)
+            if _is_within_min_hold_period(opened_at):
+                r_conf = float(r_decision.get("confidence", 0.0)) if r_decision else 0.0
+                r_is_critical_close = (r_action == "close" and r_conf >= _R_CRITICAL_CLOSE_CONF)
+                if not r_is_critical_close:
+                    # 最低保有時間内、かつR critical closeでない → holdに変換
+                    elapsed_min = (datetime.now(timezone.utc) - opened_at).total_seconds() / 60.0
+                    hold_reason = (
+                        f"[最低保有時間] エントリーから{elapsed_min:.1f}分 < {_MIN_HOLD_MINUTES}分。"
+                        f"R critical close (conf>={_R_CRITICAL_CLOSE_CONF}) 未達のためhold。"
+                        f"元の判断: {'; '.join(reasoning_parts)}"
+                    )
+                    merged_signals.append(_build_hold_signal(symbol, hold_reason))
+                    consensus_log.append(
+                        f"{symbol}: HOLD (最低保有時間: {elapsed_min:.1f}m < {_MIN_HOLD_MINUTES}m, "
+                        f"R_conf={r_conf:.2f})"
+                    )
+                    merge_stats["both_hold"] += 1
+                    logger.info(
+                        "Min hold period blocked close: symbol=%s, elapsed=%.1fm, r_conf=%.2f",
+                        symbol, elapsed_min, r_conf,
+                    )
+                    continue
+                else:
+                    # R critical closeは最低保有時間内でも許可
+                    elapsed_min = (datetime.now(timezone.utc) - opened_at).total_seconds() / 60.0
+                    reasoning_parts.append(
+                        f"[R_CRITICAL_CLOSE: conf={r_conf:.2f}>={_R_CRITICAL_CLOSE_CONF}, "
+                        f"elapsed={elapsed_min:.1f}m]"
+                    )
+                    logger.info(
+                        "Min hold period: R critical close ALLOWED: symbol=%s, elapsed=%.1fm, r_conf=%.2f",
+                        symbol, elapsed_min, r_conf,
+                    )
+
             merged_signals.append({
                 "symbol": symbol,
                 "action": "close",
