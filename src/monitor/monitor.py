@@ -145,7 +145,30 @@ def run_monitor() -> None:
         except Exception:
             logger.exception("Risk limit check failed")
 
-    # 5. パフォーマンス分析 (毎回実行、保存あり)
+    # 5. データ品質継続劣化チェック (data_health_summary の consecutive_low_score 監視)
+    health_summary_path = state_dir / "data_health_summary.json"
+    if health_summary_path.exists():
+        try:
+            health_summary = read_json(health_summary_path)
+            if isinstance(health_summary, dict):
+                consecutive_low = int(
+                    health_summary.get("events", {}).get("consecutive_low_score", 0)
+                )
+                avg_score = float(
+                    health_summary.get("score", {}).get("avg", 100)
+                )
+                # 3サイクル以上連続してスコア低下 (= 15分以上データ品質劣化継続)
+                if consecutive_low >= 3:
+                    msg = (
+                        f"データ品質継続劣化: {consecutive_low}サイクル連続スコア低下 "
+                        f"(avg={avg_score:.1f}/100)"
+                    )
+                    logger.warning(msg)
+                    alerts.append(msg)
+        except Exception:
+            logger.debug("data_health_summary read failed (non-critical)")
+
+    # 5b. パフォーマンス分析 (毎回実行、保存あり)
     try:
         from src.monitor.performance_tracker import run_analysis
         run_analysis(save_report=True)

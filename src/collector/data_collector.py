@@ -204,6 +204,9 @@ def collect(settings: dict | None = None) -> dict:
 
     # Build per-symbol data
     symbols_data: dict[str, dict] = {}
+    # フォールバック使用状況を追跡 (サイレントフォールバック防止)
+    fallback_events: list[str] = []
+
     for sym in symbols:
         prev_sym = prev_data.get("symbols", {}).get(sym, {})
 
@@ -214,8 +217,10 @@ def collect(settings: dict | None = None) -> dict:
         elif prev_sym.get("mid_price") is not None:
             mid_price = prev_sym["mid_price"]
             logger.warning("Using previous mid_price for %s", sym)
+            fallback_events.append(f"{sym}:mid_price")
         else:
             mid_price = None
+            fallback_events.append(f"{sym}:mid_price(None)")
 
         # Candles (3 timeframes) - リトライ付き
         candles = {}
@@ -236,6 +241,7 @@ def collect(settings: dict | None = None) -> dict:
             except RetryExhausted as e:
                 logger.error("Failed to fetch %s candles for %s after retries: %s", interval, sym, e)
                 candles[key] = prev_sym.get(key, [])
+                fallback_events.append(f"{sym}:{interval}_candles")
 
         # Orderbook - リトライ付き
         try:
@@ -252,6 +258,7 @@ def collect(settings: dict | None = None) -> dict:
         except RetryExhausted as e:
             logger.error("Failed to fetch orderbook for %s after retries: %s", sym, e)
             orderbook = prev_sym.get("orderbook", {"bids": [], "asks": []})
+            fallback_events.append(f"{sym}:orderbook")
 
         # Funding rate
         fr = funding_rates.get(sym)
@@ -259,6 +266,7 @@ def collect(settings: dict | None = None) -> dict:
             fr = prev_sym.get("funding_rate")
             if fr is not None:
                 logger.warning("Using previous funding_rate for %s", sym)
+                fallback_events.append(f"{sym}:funding_rate")
 
         # 5m足追加取得 (ゴムの壁モデル + 将来のアルト分析用) - リトライ付き
         try:
@@ -276,6 +284,7 @@ def collect(settings: dict | None = None) -> dict:
         except RetryExhausted as e:
             logger.error("Failed to fetch 5m candles for %s after retries: %s", sym, e)
             candles["candles_5m"] = prev_sym.get("candles_5m", [])
+            fallback_events.append(f"{sym}:5m_candles")
 
         symbols_data[sym] = {
             "mid_price": mid_price,
@@ -324,6 +333,48 @@ def collect(settings: dict | None = None) -> dict:
     logger.info(
         "Market data saved: %d symbols -> %s", len(symbols_data), output_path
     )
+
+    # フォールバック多発時アラート (サイレントフォールバック防止)
+    # 重要データ (5m_candles) のフォールバックが1件以上発生した場合に通知
+    critical_fallbacks = [e for e in fallback_events if "5m_candles" in e or "mid_price" in e]
+    if critical_fallbacks:
+        logger.warning(
+            "Data collection fallbacks detected (%d events): %s",
+            len(fallback_events), ", ".join(fallback_events),
+        )
+        try:
+            from src.monitor.telegram_notifier import send_message
+            # フォールバック状態ファイルで重複通知を抑制 (30分クールダウン)
+            data_dir_path = Path(str(data_dir))
+            fb_state_path = data_dir_path.parent / "state" / "collector_fallback_state.json"
+            should_notify = True
+            try:
+                fb_state = read_json(fb_state_path)
+                if isinstance(fb_state, dict):
+                    last_ts = fb_state.get("last_alert")
+                    if last_ts:
+                        elapsed = (datetime.now(timezone.utc) -
+                                   datetime.fromisoformat(last_ts)).total_seconds()
+                        if elapsed < 1800:
+                            should_notify = False
+            except Exception:
+                pass
+
+            if should_notify:
+                send_message(
+                    f"*WARNING: データ収集フォールバック*\n"
+                    f"APIリトライ後も取得失敗 → 前回データ使用\n"
+                    f"対象: {', '.join(fallback_events[:5])}"
+                )
+                atomic_write_json(fb_state_path, {
+                    "last_alert": datetime.now(timezone.utc).isoformat(),
+                    "fallback_events": fallback_events,
+                })
+        except Exception as e:
+            logger.warning("Failed to send fallback alert: %s", e)
+    elif fallback_events:
+        # 非重要フォールバック (funding_rate等) はログのみ
+        logger.info("Minor fallbacks (non-critical): %s", ", ".join(fallback_events))
 
     # アーカイブ保存 (バックテスト用履歴蓄積)
     try:
