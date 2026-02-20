@@ -712,6 +712,75 @@ def _log_rubber_signal(signal: dict) -> None:
     atomic_write_json(log_path, logs)
 
 
+_EQUITY_MIN_USD = 50.0
+_EQUITY_MAX_USD = 10_000.0
+
+
+def _sanitize_equity_in_context(context: dict) -> None:
+    """daily_pnl.equityの異常値を検出し、前回値(daily_pnl.json)にフォールバックする。
+
+    4.10 USD などの間欠的な異常値がAgent Rのリスク判断を歪める問題への対処。
+    検証範囲: 50 USD <= equity <= 10,000 USD
+    範囲外の場合: daily_pnl.jsonの値を維持し、contextを上書きする。
+    """
+    daily_pnl = context.get("daily_pnl")
+    if not isinstance(daily_pnl, dict):
+        return
+
+    raw_equity = daily_pnl.get("equity")
+    try:
+        equity = float(raw_equity)
+    except (TypeError, ValueError):
+        logger.warning("equity sanity: unparseable equity=%r, skipping check", raw_equity)
+        return
+
+    if _EQUITY_MIN_USD <= equity <= _EQUITY_MAX_USD:
+        return  # 正常範囲
+
+    # 異常値 → daily_pnl.jsonから前回値を読み直す
+    logger.warning(
+        "equity sanity: ABNORMAL equity=%.2f USD (range %.0f-%.0f), loading fallback from daily_pnl.json",
+        equity, _EQUITY_MIN_USD, _EQUITY_MAX_USD,
+    )
+    persisted = _load_json_safe(STATE_DIR / "daily_pnl.json")
+    if not isinstance(persisted, dict):
+        logger.error("equity sanity: cannot load daily_pnl.json for fallback")
+        return
+
+    fallback_equity = persisted.get("equity")
+    try:
+        fallback_equity = float(fallback_equity)
+    except (TypeError, ValueError):
+        logger.error("equity sanity: fallback equity also invalid=%r", fallback_equity)
+        return
+
+    if _EQUITY_MIN_USD <= fallback_equity <= _EQUITY_MAX_USD:
+        context["daily_pnl"]["equity"] = fallback_equity
+        logger.info(
+            "equity sanity: fallback applied %.2f -> %.2f USD",
+            equity, fallback_equity,
+        )
+    else:
+        # start_of_day_equityを試みる
+        start_equity = persisted.get("start_of_day_equity")
+        try:
+            start_equity = float(start_equity)
+            if _EQUITY_MIN_USD <= start_equity <= _EQUITY_MAX_USD:
+                context["daily_pnl"]["equity"] = start_equity
+                logger.warning(
+                    "equity sanity: using start_of_day_equity %.2f as last resort",
+                    start_equity,
+                )
+                return
+        except (TypeError, ValueError):
+            pass
+        logger.error(
+            "equity sanity: both current=%.2f and persisted=%.2f are out of range; "
+            "leaving context unchanged",
+            equity, fallback_equity,
+        )
+
+
 def main() -> None:
     """メイン実行: コンテキスト構築 → 3エージェント呼び出し → マージ → 出力。"""
     settings = load_settings()
@@ -730,6 +799,9 @@ def main() -> None:
         logger.error("Context build failed: %s", e)
         _write_fallback_and_exit(symbols, f"コンテキスト構築失敗: {e}")
         return
+
+    # 1b. equity sanity check: 異常値は前回値にフォールバック
+    _sanitize_equity_in_context(context)
 
     # rubber_wall モード: LLM合議をバイパス
     if strategy_mode == "rubber_wall":
