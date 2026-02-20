@@ -142,8 +142,16 @@ def run_monitor() -> None:
                         logger.critical(msg)
                         alerts.append(msg)
                         send_message(f"*KILL SWITCH* {msg}")
-        except Exception:
+        except Exception as e:
             logger.exception("Risk limit check failed")
+            # サイレントフォールバック防止: risk check 例外も通知
+            err_msg = f"WARNING: リスク制限チェックで予期しない例外: {e}"
+            logger.critical(err_msg)
+            alerts.append(err_msg)
+            try:
+                send_message(f"*WARNING: Risk check exception*\n{e}\nリスク監視が機能していない可能性があります。ログを確認してください。")
+            except Exception:
+                pass  # 通知失敗は無視 (send_message 内でリトライ済み)
 
     # 5. データ品質継続劣化チェック (data_health_summary の consecutive_low_score 監視)
     health_summary_path = state_dir / "data_health_summary.json"

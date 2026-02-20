@@ -63,7 +63,9 @@ def _track_agent_failure(failed: bool) -> None:
     atomic_write_json(_AGENT_FAILURE_STATE_PATH, state)
 
     if consecutive >= _AGENT_FAILURE_THRESHOLD:
-        _trigger_agent_failure_alert(consecutive)
+        # 初回 (==3) + 以降は2サイクルおきに繰り返しアラート (5, 7, 9... 回目)
+        if consecutive == _AGENT_FAILURE_THRESHOLD or (consecutive % 2 == 1):
+            _trigger_agent_failure_alert(consecutive)
 
 
 def _trigger_agent_failure_alert(consecutive: int) -> None:
