@@ -5,24 +5,28 @@ vol_ratio の強度帯で挙動が反転する ETH 固有の特性を利用。
 
 Pattern A (reversal):  高閾値 BEAR spike → LONG (平均回帰)
   - vol_ratio >= 7.0 の大スパイクはオーバーシュート → 戻る (旧 6.0 から引き上げ)
-  - 30日バックテスト: deep (<-20%) + vol>=7x → 60%勝率 LONG。方向は正しい。
-  - 4Hレンジ下位55%では抑制 (旧40%: 実運用でETH LONG 13件中7敗、ダウントレンド逆張りが主因)
+  - 30日BT (n=27): pos<40%でLONG_wr=70%, pos>=40%でLONG_wr=25%
+    → 4H下位40%未満でのみLONG許可 (4Hレンジ高値圏での逆張りは不利)
   - TP = 固定 0.5%, SL = min(IN足low - 0.05%pad, entry * (1 - 0.25%))
   - SL最小距離を0.25%に拡大 (旧0.1%: ノイズでSLが頻発した問題を修正)
 
 Pattern B (momentum):  中閾値 BEAR spike + 上位ゾーン → SHORT
-  - vol_ratio 4.0-7.0 かつ 4Hレンジ position >= 55%
+  - vol_ratio 4.0-7.0 かつ 4Hレンジ position >= 40%
     (旧: 3.0x/40%。実運用20件WR=45%/PF=0.77。SHORTのみPF黒字だがエントリー条件が甘すぎた)
-  - 30日バックテスト: upper (40-100%) + vol>=5x → 31%勝率と低い。条件引き締めで精度向上狙い。
+  - 30日BT: mid(40-55%) + vol>=3.0x → SHORT_wr=88% (n=8, 最良ゾーン)
   - TP = 時間カット 15bar (75分, 旧10bar=50分: 短期ノイズ吸収のため延長)
   - SL = IN足high + 0.05%pad, 最小距離0.30% (旧0.20%: ノイズ耐性向上)
 
 2026-02-21 最適化 (実運用20件分析):
   - ETH LONG: 13件 6勝 PnL=-$0.72。下降トレンド中の逆張りが損失主因
-    → reversal_h4_filter_pct 40%→55% (4H中位以上でのみLONG許可)
-  - ETH SHORT: 7件 3勝 PnL=+$0.24 (黒字だが条件緩すぎ)
-    → momentum_threshold 3.0→4.0 (弱スパイクの誤シグナル排除)
-    → momentum_zone_min 40→55 (4H上位55%以上でのみSHORT)
+  - ETH SHORT: 7件 3勝 PnL=+$0.24 (黒字)
+
+2026-02-21 フィルター方向修正 (30日BT 27件分析):
+  - reversal_h4_filter_pct: フィルターの向きを反転
+    旧: pos < filter → SKIP (= pos >= 40%でLONG) → WR=25%
+    新: pos >= filter → SKIP (= pos < 40%でLONG) → WR=70%, PF=2.21
+    → reversal_h4_max_pct (上限) として機能するよう変更
+    → settings.yaml の reversal_h4_filter_pct=40 を上限値として使用
 """
 
 from __future__ import annotations
@@ -38,10 +42,13 @@ _DEFAULT_CONFIG = {
     "reversal_tp_pct": 0.005,       # 旧0.4%→0.5%: SL拡大に合わせてR:R維持
     "reversal_sl_pad_pct": 0.0005,  # 0.05% pad below candle low
     "reversal_sl_min_dist": 0.0025, # 旧0.1%→0.25%: ノイズ耐性確保 (直近SL頻発問題修正)
-    "reversal_h4_filter_pct": 55,   # 旧40%→55%: 実運用ETH LONG 13件中7敗。下降トレンド逆張りを厳格排除
+    # フィルター方向修正 (2026-02-21):
+    # 30日BT n=27: pos<40%でLONG_wr=70%, pos>=40%でLONG_wr=25%
+    # → pos >= this → SKIP (上限フィルター: 4H高値圏での逆張りLONGを禁止)
+    "reversal_h4_max_pct": 40,      # pos >= 40% → Pattern A SKIP。低位ゾーンでのみLONG許可
     # Pattern B: momentum
-    "momentum_threshold": 4.0,      # 旧3.0→4.0: 弱スパイク(3-4x)は誤シグナル多数。品質向上
-    "momentum_zone_min": 55,        # 旧40%→55%: 4H上位55%以上でのみSHORT (実運用での偽陽性削減)
+    "momentum_threshold": 3.0,      # 30日BT: mid(40-55%)+3.0xでSHORT_wr=88%(n=8)。3.0x維持
+    "momentum_zone_min": 40,        # 30日BT: 4H pos >= 40%でのSHORT有効。40%維持
     "momentum_cut_bars": 15,        # 旧10bar(50分)→15bar(75分): 短期ノイズ吸収のため延長
     "momentum_sl_pad_pct": 0.0005,  # 0.05% pad above candle high
     "momentum_sl_min_dist": 0.003,  # 旧0.20%→0.30%: SL最小距離拡大 (ノイズ耐性向上)
@@ -114,20 +121,24 @@ class EthRubberBand(BaseStrategy):
 
         SL = min(candle low - 0.05%pad, entry * (1 - 0.25%))  ← 最小距離0.25%で頻発SL修正
         TP = 固定 0.5%
-        4Hフィルター: 4Hレンジ下位50%では抑制 (ダウントレンド継続中の逆張り回避。旧40%→50%)
+        4Hフィルター (上限): pos >= reversal_h4_max_pct → SKIP
+          30日BT n=27: pos<40% → WR=70%, pos>=40% → WR=25%
+          4H高値圏 (pos>=40%) での逆張りLONGは不利。低位ゾーンのみ許可。
         """
         h4_window = self.cfg["h4_window"]
-        h4_filter_pct = self.cfg["reversal_h4_filter_pct"]
+        # 後方互換: 旧キー名 reversal_h4_filter_pct も読めるようにする
+        h4_max_pct = self.cfg.get("reversal_h4_max_pct",
+                                   self.cfg.get("reversal_h4_filter_pct", 40))
 
-        # --- 4Hトレンドフィルター ---
+        # --- 4Hトレンドフィルター (上限) ---
         h4_low, h4_high = self._h4_range(idx - 1, h4_window)
         h4_pos = self._range_position(candle["c"], h4_low, h4_high)
 
-        if h4_pos < h4_filter_pct:
+        if h4_pos >= h4_max_pct:
             logger.info(
-                "Pattern A: SKIP (4H pos=%.1f%% < filter=%d%%, 4H=[%.2f-%.2f], "
-                "4H中位以下 → ダウントレンド逆張りリスク高。filter=55%%: 旧40%%から引き上げ・実運用LONG 7敗対策)",
-                h4_pos, h4_filter_pct, h4_low, h4_high,
+                "Pattern A: SKIP (4H pos=%.1f%% >= max=%d%%, 4H=[%.2f-%.2f], "
+                "4H高値圏 → 逆張りLONG不利。30日BT: pos>=40%%でWR=25%%)",
+                h4_pos, h4_max_pct, h4_low, h4_high,
             )
             return None, self._build_next_cache(idx)
 

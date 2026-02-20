@@ -7,16 +7,24 @@
 キャッシュヒット時は O(1) で判定完了。
 
 ゾーン:
-  貫通    (-20% ~ 0%):   SHORT  TP 0.5%  (30日分 vol>=5x: 56%勝率)
-  レンジ上  (20% ~):       SHORT  TP 0.3%  (30日分 vol>=5x: upper 77%勝率)
-  深突破   (~ -20%):      LONG   TP 0.3%  (30日分 vol>=5x: 40%勝率、参考程度)
-  底付近   (0% ~ 20%):    SKIP
+  貫通    (-20% ~ 0%):   LONG   TP 0.3%  SL 0.6% (30日分 vol>=5x: LONG_wr=55%, PF=2.33)
+  レンジ上  (20% ~):       SHORT  TP 0.3%  (30日分 vol>=5x: SHORT_wr=59%, PF=2.06)
+  深突破   (~ -20%):      SKIP   (LONG/SHORT 双方 30-40%。エッジ不明確のためSKIP)
+  底付近   (0% ~ 20%):    SKIP   (SHORT_wr=55%だが現価格がレンジ底近傍でリスク高)
 
 2026-02-21 vol_threshold 7.0→5.0 変更:
-  - 30日分バックテスト: vol>=5.0 BEAR spike のうち upper ゾーンで 77%勝率
+  - 30日分バックテスト: vol>=5.0 BEAR spike のうち upper ゾーンで 59%勝率
   - vol>=7.0 は3日分で2回のみ → 機会損失が過大
   - vol>=5.0 は30日で68回 → 適切な頻度 (1日2-3回)
-  - penetration ゾーン: 56%勝率 → エッジあり
+
+2026-02-21 penetration ゾーン LONG 変更:
+  - 30日BT n=22: LONG_wr=55%, SHORT_wr=32%, avg_ret=+0.230%
+  - TP 0.3%/SL 0.6% シミュレーション: W=14/L=3 PF=2.33
+  - BEARスパイク + レンジ下抜け = 売り過剰 → 反転LONGが有効
+  - 旧設定(SHORT)は逆方向で損失原因だった
+
+2026-02-21 deep_reversal SKIP 変更:
+  - 旧LONG: 40%勝率でエッジ不明確。penetrationと合わせてSKIPに変更
 """
 
 from __future__ import annotations
@@ -28,14 +36,20 @@ logger = setup_logger("btc_rubber_wall")
 
 # デフォルト設定
 _DEFAULT_CONFIG = {
-    "vol_threshold": 5.0,   # 旧7.0→5.0: 30日バックテストで upper 77%勝率、機会損失削減
+    "vol_threshold": 5.0,   # 旧7.0→5.0: 30日バックテストで upper 59%勝率、機会損失削減
     "h4_window": 48,
     "vol_window": 288,
     "zones": {
-        "penetration": {"range": [-20, 0], "direction": "short", "tp_pct": 0.005},
-        "upper_range": {"range": [20, 999], "direction": "short", "tp_pct": 0.003},
-        "deep_reversal": {"range": [-999, -20], "direction": "long", "tp_pct": 0.003},
-        # bottom (0~20): skip
+        # penetration: LONG変更 (旧SHORT)
+        # 30日BT BEAR spike>=5x: LONG_wr=55%, TP0.3%/SL0.6%でPF=2.33
+        # BEARスパイク + 4Hレンジ下抜けは売り過剰 → 反転LONG
+        "penetration": {"range": [-20, 0], "direction": "long", "tp_pct": 0.003, "sl_pct": 0.006},
+        # upper_range: SHORT維持
+        # 30日BT BEAR spike>=5x: SHORT_wr=59%, avg=-0.321%
+        "upper_range": {"range": [20, 999], "direction": "short", "tp_pct": 0.003, "sl_pct": 0.006},
+        # deep_reversal: SKIP (旧LONG: 30-40%勝率でエッジ不明確)
+        # "deep_reversal": {"range": [-999, -20], "direction": "long", "tp_pct": 0.003},
+        # bottom (0~20): skip (SHORT_wr=55%だが現位置がレンジ底近傍でリスク高)
     },
 }
 
@@ -128,15 +142,17 @@ class BtcRubberWall(BaseStrategy):
 
         direction = matched_cfg["direction"]
         tp_pct = matched_cfg["tp_pct"]
+        # sl_pct が明示指定されていれば使用、なければ tp_pct * 2 をフォールバック
+        sl_pct = matched_cfg.get("sl_pct", tp_pct * 2)
         entry_price = candle["c"]
 
         # TP/SL 計算
         if direction == "short":
             tp_price = entry_price * (1 - tp_pct)
-            sl_price = entry_price * (1 + tp_pct * 2)  # SL = 2x TP幅
+            sl_price = entry_price * (1 + sl_pct)
         else:  # long
             tp_price = entry_price * (1 + tp_pct)
-            sl_price = entry_price * (1 - tp_pct * 2)
+            sl_price = entry_price * (1 - sl_pct)
 
         signal = {
             "symbol": "BTC",
@@ -151,7 +167,7 @@ class BtcRubberWall(BaseStrategy):
                 f"RubberWall: {matched_zone} zone (pos={pos:.1f}%), "
                 f"vol_ratio={ratio:.1f}x, "
                 f"4H=[{h4_low:.2f}-{h4_high:.2f}], "
-                f"→ {direction} TP {tp_pct*100:.1f}%"
+                f"→ {direction} TP {tp_pct*100:.1f}% SL {sl_pct*100:.1f}%"
             ),
             "zone": matched_zone,
             "range_position": round(pos, 1),

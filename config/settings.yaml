@@ -22,12 +22,15 @@ strategy:
     reversal_tp_pct: 0.005       # Pattern A: TP 0.5% (旧0.4%→0.5%)
     reversal_sl_pad_pct: 0.0005  # Pattern A: SL = candle low - 0.05% pad
     reversal_sl_min_dist: 0.0025 # Pattern A: SL最小距離0.25% (旧0.1%→0.25%, ノイズSL修正)
-    reversal_h4_filter_pct: 40   # Pattern A: 4Hレンジ下位40%では抑制 (50%→40%: 静観多発により緩和)
+    reversal_h4_max_pct: 40      # Pattern A: 4H pos >= 40% → SKIP (上限フィルター)
+                                 # 30日BT n=27: pos<40%でWR=70%, pos>=40%でWR=25%
+                                 # 旧reversal_h4_filter_pct (下限フィルター) から変更
     momentum_threshold: 3.0      # Pattern B: >= this & < reversal → SHORT
-    momentum_zone_min: 40        # Pattern B: 4H position >= 40% (旧50%: 機会ゼロにより40%に緩和)
-    momentum_cut_bars: 15        # Pattern B: 75分 (15bar) で時間カット (旧10bar=50分→15bar: ノイズ吸収延長・コードデフォルト整合)
+                                 # 30日BT: mid(40-55%)+3.0xでSHORT_wr=88%(n=8)
+    momentum_zone_min: 40        # Pattern B: 4H position >= 40% (30日BTで有効)
+    momentum_cut_bars: 15        # Pattern B: 75分 (15bar) で時間カット
     momentum_sl_pad_pct: 0.0005  # Pattern B: SL = candle high + 0.05% pad
-    momentum_sl_min_dist: 0.003  # Pattern B: SL最小距離0.30% (コードデフォルト明示)
+    momentum_sl_min_dist: 0.003  # Pattern B: SL最小距離0.30%
     h4_window: 48
     vol_window: 288
   sol_rubber_wall:               # SOL: BTC型ゴムの壁 (BEAR spike → SHORT メイン)
