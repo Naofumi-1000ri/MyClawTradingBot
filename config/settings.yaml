@@ -8,7 +8,35 @@ hyperliquid:
   mainnet_url: "https://api.hyperliquid.xyz"
   testnet_url: "https://api.hyperliquid-testnet.xyz"
 
-# Trading pairs to monitor
+# Strategy (ゴム理論ベース、ルールベース)
+strategy:
+  rubber_wall:                   # BTC: BEAR spike → SHORT (ゴムの壁)
+    symbol: "BTC"
+    vol_threshold: 7.0
+    h4_window: 48
+    vol_window: 288
+    timeout_candles: 5
+  rubber_band:                   # ETH: 2パターン ゴムバンド
+    symbol: "ETH"
+    reversal_threshold: 7.0      # Pattern A: >= this → LONG reversal (旧6.0→7.0)
+    reversal_tp_pct: 0.005       # Pattern A: TP 0.5% (旧0.4%→0.5%)
+    reversal_sl_pad_pct: 0.0005  # Pattern A: SL = candle low - 0.05% pad
+    reversal_sl_min_dist: 0.0025 # Pattern A: SL最小距離0.25% (旧0.1%→0.25%, ノイズSL修正)
+    reversal_h4_filter_pct: 40   # Pattern A: 4Hレンジ下位40%では抑制 (ダウントレンド回避)
+    momentum_threshold: 3.0      # Pattern B: >= this & < reversal → SHORT
+    momentum_zone_min: 30        # Pattern B: 4H position >= 30% のみ
+    momentum_cut_bars: 10        # Pattern B: 50分 (10bar) で時間カット
+    momentum_sl_pad_pct: 0.0005  # Pattern B: SL = candle high + 0.05% pad
+    h4_window: 48
+    vol_window: 288
+  sol_rubber_wall:               # SOL: BTC型ゴムの壁 (BEAR spike → SHORT メイン)
+    symbol: "SOL"
+    vol_threshold: 5.0           # メインSHORT: 5x (SOLはスパイク頻度が低い)
+    deep_threshold: 7.0          # deep_below LONG: 7x+ 高閾値
+    h4_window: 48
+    vol_window: 288
+
+# Trading pairs to monitor (データ収集対象。トレード対象は strategy で制御)
 trading:
   symbols:
     - "BTC"
@@ -17,13 +45,38 @@ trading:
   default_leverage: 3
   max_leverage: 10
   min_confidence: 0.7
+  decision_gate:
+    partial_consensus_min_confidence: 0.72
+    entry_cooldown_minutes: 10
+    max_equity_drift_pct: 20.0
+    max_daily_loss_for_new_entries_pct: 2.0
+    min_rr: 1.0
+    min_data_quality_score: 80
+    close_only_score_threshold: 80
+    kill_switch_proposal_score_threshold: 60
+    max_spread_bps: 8.0
+    min_orderbook_imbalance: 1.1
+    min_orderbook_imbalance_by_symbol:
+      BTC: 1.0
+      ETH: 1.0
+      SOL: 0.35
+  position_scaling:
+    enabled: true
+    phase1_trades: 30
+    phase2_trades: 50
+    phase1_multiplier: 1.5
+    phase2_multiplier: 2.0
+    degraded_mode_multiplier: 1.0
+    emergency_multiplier: 0.5
+    min_expectancy_usd: 0.0
+    max_drawdown_pct: 2.0
+    max_low_score_events: 0
+    low_score_threshold: 80
+    loss_streak_limit: 3
 
-# AI Brain settings
+# Brain settings (ルールベース戦略、LLM不使用)
 brain:
-  model: "sonnet"  # sonnet for regular cycles, opus for weekly analysis
-  session_reset_hours: 24
-  max_candles: 24        # 15-min candles to include in context
-  orderbook_depth: 5     # orderbook levels to include
+  orderbook_depth: 5     # orderbook levels to include in context
 
 # Cycle settings
 cycle:
@@ -36,6 +89,16 @@ paths:
   signals_dir: "signals"
   state_dir: "state"
   logs_dir: "logs"
+
+# Hypothesis Lab settings
+hypothesis:
+  archive_days: 7              # market_data archive retention
+  max_hypotheses: 50           # max active hypotheses
+  backtest_min_samples: 5      # min samples for basic backtest
+  strict_min_samples: 10       # min samples for strict backtest
+  shadow_min_activations: 5    # min activations before promotion
+  shadow_min_winrate: 0.55     # min win rate for promotion
+  proven_confidence_bonus: 0.05  # confidence bonus for proven hypotheses
 
 # Telegram notifications
 telegram:
