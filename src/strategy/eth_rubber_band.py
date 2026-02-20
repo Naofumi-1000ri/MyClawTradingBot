@@ -5,12 +5,13 @@ vol_ratio の強度帯で挙動が反転する ETH 固有の特性を利用。
 
 Pattern A (reversal):  高閾値 BEAR spike → LONG (平均回帰)
   - vol_ratio >= 7.0 の大スパイクはオーバーシュート → 戻る (旧 6.0 から引き上げ)
-  - 4Hレンジ下位50%では抑制 (4Hダウントレンド中の逆張りを回避。旧40%→50%に強化)
+  - 4Hレンジ下位40%では抑制 (4Hダウントレンド中の逆張りを回避。50%→40%に緩和:
+    50%フィルターが厳しすぎて下降トレンド中に全スキップ → トレード機会損失のため緩和)
   - TP = 固定 0.5%, SL = min(IN足low - 0.05%pad, entry * (1 - 0.25%))
   - SL最小距離を0.25%に拡大 (旧0.1%: ノイズでSLが頻発した問題を修正)
 
 Pattern B (momentum):  中閾値 BEAR spike + 上位ゾーン → SHORT
-  - vol_ratio 3.0-7.0 かつ 4Hレンジ position >= 50% (旧30%→50%: 確度向上)
+  - vol_ratio 3.0-7.0 かつ 4Hレンジ position >= 30% (settings.yamlの30%が有効値)
   - TP = 時間カット 15bar (75分, 旧10bar=50分: 短期ノイズ吸収のため延長)
   - SL = IN足high + 0.05%pad, 最小距離0.30% (旧0.20%: ノイズ耐性向上)
   - 改善理由: 実運用で10bar内に決着がつかないケースが多発。4Hゾーン絞り込みで
@@ -30,7 +31,7 @@ _DEFAULT_CONFIG = {
     "reversal_tp_pct": 0.005,       # 旧0.4%→0.5%: SL拡大に合わせてR:R維持
     "reversal_sl_pad_pct": 0.0005,  # 0.05% pad below candle low
     "reversal_sl_min_dist": 0.0025, # 旧0.1%→0.25%: ノイズ耐性確保 (直近SL頻発問題修正)
-    "reversal_h4_filter_pct": 50,   # 4Hレンジ下位50%では反転LONG抑制 (旧40%→50%: ダウントレンド中回避強化)
+    "reversal_h4_filter_pct": 40,   # 4Hレンジ下位40%では反転LONG抑制 (50%→40%: 静観多発により緩和、下降トレンドでも強スパイク時はLONG有効)
     # Pattern B: momentum
     "momentum_threshold": 3.0,      # lower bound
     "momentum_zone_min": 50,        # 旧30%→50%: 4H上位50%以上に絞り込み (確度向上)
@@ -118,7 +119,7 @@ class EthRubberBand(BaseStrategy):
         if h4_pos < h4_filter_pct:
             logger.info(
                 "Pattern A: SKIP (4H pos=%.1f%% < filter=%d%%, 4H=[%.2f-%.2f], "
-                "4H下位ゾーン → ダウントレンド継続リスク高)",
+                "4H下位ゾーン → ダウントレンド継続リスク高。filter=40%%: 旧50%%から緩和済み)",
                 h4_pos, h4_filter_pct, h4_low, h4_high,
             )
             return None, self._build_next_cache(idx)

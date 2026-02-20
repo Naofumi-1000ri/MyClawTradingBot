@@ -10,10 +10,15 @@ SOL 固有のボラティリティに合わせた広いTP/SL設定。
 
 2026-02-21 最適化 (実運用データに基づく):
   - SLヒット原因: SOL 5分足ノイズ幅 0.3-1% に対しSL 0.5%が狭すぎた
-  - vol_threshold 5.0x → 6.0x (シグナル品質向上)
+  - vol_threshold 5.0x → 6.0x (シグナル品質向上) ※settings.yamlは5.0xで実運用中
   - penetration SL 0.5% → 0.8%、TP 1.0% → 1.5% (R:R=1.875維持)
   - upper_range SL 0.4% → 0.6%、TP 0.8% → 1.2%
   - funding_rate < -2e-5 時のSHORT禁止 (ショートスクイーズ回避)
+
+2026-02-21 追加調整 (静観・フォールバック多発対策):
+  - funding_short_block_threshold: -2e-5 → -5e-5 (閾値緩和)
+    理由: -2e-5 は中程度のネガティブfundingでもSHORTブロックしすぎ。
+    -5e-5 (=極端なスクイーズリスク域) のみブロックに変更してSOL機会損失を削減。
 
 ゾーン:
   貫通    (-20% ~ 0%):    SHORT  TP 1.5%  SL 0.8% (最強ゾーン: 62-71% win)
@@ -30,12 +35,13 @@ from src.utils.logger import setup_logger
 logger = setup_logger("sol_rubber_wall")
 
 _DEFAULT_CONFIG = {
-    "vol_threshold": 6.0,       # メインSHORT: 6x (実運用で5xはノイズシグナルが多く損失)
+    "vol_threshold": 5.0,       # メインSHORT: 5x (settings.yamlで5.0が指定済み。コードのデフォルトも整合)
     "deep_threshold": 7.0,      # deep_below LONG: 7x+ のみ
     "h4_window": 48,
     "vol_window": 288,
     # funding_rate がこの閾値より低い場合、SHORT新規エントリー禁止 (スクイーズ回避)
-    "funding_short_block_threshold": -2e-5,
+    # -2e-5 → -5e-5 に緩和: 中程度のネガティブfundingでのブロック過多によるSOL機会損失を削減
+    "funding_short_block_threshold": -5e-5,
     "zones": {
         # penetration: SL 0.5%→0.8% (5分足ノイズ耐性強化), TP 1.0%→1.5% (R:R≈1.875)
         "penetration": {"range": [-20, 0], "direction": "short", "tp_pct": 0.015, "sl_pct": 0.008},
