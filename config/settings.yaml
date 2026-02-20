@@ -18,7 +18,7 @@ strategy:
     h4_window: 48
     vol_window: 288
     timeout_candles: 5
-  rubber_band:                   # ETH: 2パターン ゴムバンド
+  rubber_band:                   # ETH: 3パターン ゴムバンド
     symbol: "ETH"
     reversal_threshold: 7.0      # Pattern A: >= this → LONG reversal (旧6.0→7.0)
     reversal_tp_pct: 0.005       # Pattern A: TP 0.5% (旧0.4%→0.5%)
@@ -33,6 +33,17 @@ strategy:
     momentum_cut_bars: 15        # Pattern B: 75分 (15bar) で時間カット
     momentum_sl_pad_pct: 0.0005  # Pattern B: SL = candle high + 0.05% pad
     momentum_sl_min_dist: 0.003  # Pattern B: SL最小距離0.30%
+    # Pattern C: quiet_long (静観脱却 - 2026-02-21追加)
+    # スパイク不要。低出来高+GOLDEN+4H底値圏 → LONG
+    # 30日BT n=22: WR=68.2%, EV=+0.179%, 約2.0件/日 (静観市場での代替戦略)
+    quiet_long_enabled: true          # Pattern C 有効 (false で無効化可能)
+    quiet_long_h4_max_pct: 35         # 4H pos < 35% (底値圏のみ。BT最適値)
+    quiet_long_vol_ratio_max: 0.60    # 直近5本/100本平均 < 0.60 (低出来高確認)
+    quiet_long_vol_short_window: 5    # 直近N本の出来高平均
+    quiet_long_vol_long_window: 100   # 比較対象の長期出来高平均
+    quiet_long_tp_pct: 0.004          # TP 0.4% (30日BT最適: TP0.4/SL0.6/10bar)
+    quiet_long_sl_pct: 0.006          # SL 0.6%
+    quiet_long_cut_bars: 10           # 10bar (50分) タイムアウト
     h4_window: 48
     vol_window: 288
   sol_rubber_wall:               # SOL: BTC型ゴムの壁 (BEAR spike → SHORT メイン)

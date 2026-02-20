@@ -17,6 +17,14 @@ Pattern B (momentum):  中閾値 BEAR spike + 上位ゾーン → SHORT
   - TP = 時間カット 15bar (75分, 旧10bar=50分: 短期ノイズ吸収のため延長)
   - SL = IN足high + 0.05%pad, 最小距離0.30% (旧0.20%: ノイズ耐性向上)
 
+Pattern C (quiet_long):  スパイクなし + 低出来高 + GOLDEN + 4H低位 → LONG
+  - スパイク不要: Rubber戦略が機能しない「静かな市場」でも発火する代替戦略
+  - 条件: EMA9 > EMA21 (GOLDEN), 4H pos < 35% (底値圏), 直近5本/100本出来高比 < 0.60
+  - 30日BT (n=22): WR=68.2% (TP達成), SL hit=13.6%, Timeout=18.2%, EV=+0.179%
+  - TP = 0.4%, SL = 0.6%, タイムアウト = 10bar (50分)
+  - 頻度: 約1.0件/日 (パターンA/Bのスパイク待ちより大幅に増加)
+  - 静観・フォールバック状態を打破する主要な代替戦略
+
 2026-02-21 最適化 (実運用20件分析):
   - ETH LONG: 13件 6勝 PnL=-$0.72。下降トレンド中の逆張りが損失主因
   - ETH SHORT: 7件 3勝 PnL=+$0.24 (黒字)
@@ -27,6 +35,11 @@ Pattern B (momentum):  中閾値 BEAR spike + 上位ゾーン → SHORT
     新: pos >= filter → SKIP (= pos < 40%でLONG) → WR=70%, PF=2.21
     → reversal_h4_max_pct (上限) として機能するよう変更
     → settings.yaml の reversal_h4_filter_pct=40 を上限値として使用
+
+2026-02-21 Pattern C追加 (静観脱却):
+  - 30日BT n=22: WR=68.2%, EV=+0.179%, SL hit=13.6%, Timeout=18.2%
+  - 低出来高時 (直近5本/100本 < 60%) に発火: 約1.0件/日
+  - スパイク不要のため、vol>=7.0xが0件の「静かな市場」でもトレード可能
 """
 
 from __future__ import annotations
@@ -52,6 +65,17 @@ _DEFAULT_CONFIG = {
     "momentum_cut_bars": 15,        # 旧10bar(50分)→15bar(75分): 短期ノイズ吸収のため延長
     "momentum_sl_pad_pct": 0.0005,  # 0.05% pad above candle high
     "momentum_sl_min_dist": 0.003,  # 旧0.20%→0.30%: SL最小距離拡大 (ノイズ耐性向上)
+    # Pattern C: quiet_long (静観脱却)
+    # 30日BT n=22: WR=68.2%, EV=+0.179%, 約1.0件/日
+    # スパイク不要。低出来高の静かな市場でGOLDEN+底値圏のLONG
+    "quiet_long_enabled": True,          # Pattern C 有効/無効フラグ
+    "quiet_long_h4_max_pct": 35,         # 4H pos < 35% (底値圏: 30日BT最適値)
+    "quiet_long_vol_ratio_max": 0.60,    # 直近5本/100本平均 < 0.60 (低出来高確認)
+    "quiet_long_vol_short_window": 5,    # 直近N本の出来高平均 (分子)
+    "quiet_long_vol_long_window": 100,   # 比較対象の出来高平均 (分母)
+    "quiet_long_tp_pct": 0.004,          # TP 0.4% (30日BT最適)
+    "quiet_long_sl_pct": 0.006,          # SL 0.6%
+    "quiet_long_cut_bars": 10,           # 10bar (50分) タイムアウト
     # shared
     "h4_window": 48,
     "vol_window": 288,
@@ -74,6 +98,10 @@ class EthRubberBand(BaseStrategy):
         キャッシュあり → 閾値比較のみ O(1)
         キャッシュなし → 対象足のみ計算 O(window)
 
+        スキャン順序:
+          1. Pattern A/B: BEARスパイク検知 (従来通り)
+          2. Pattern C: スパイクなし + 低出来高 + GOLDEN + 4H底値圏 → quiet_long
+
         Returns:
             (signal_or_None, next_cache) タプル
         """
@@ -93,20 +121,38 @@ class EthRubberBand(BaseStrategy):
         is_bear = candle["c"] < candle["o"]
 
         if not is_bear:
-            return None, self._build_next_cache(idx)
+            next_cache = self._build_next_cache(idx)
+            # BEARでない → Pattern A/B はスキップ。Pattern C を確認
+            if self.cfg.get("quiet_long_enabled", True):
+                sig_c = self._pattern_c_quiet_long(idx, candle)
+                if sig_c:
+                    return sig_c, next_cache
+            return None, next_cache
 
         # --- Fast path: キャッシュ閾値で判定 ---
         if cache and cache.get("next_target_t") == candle["t"]:
             threshold_vol = cache["threshold_vol"]
             if candle["v"] < threshold_vol:
-                return None, self._build_next_cache(idx)
+                next_cache = self._build_next_cache(idx)
+                # スパイク閾値未満 → Pattern C を確認
+                if self.cfg.get("quiet_long_enabled", True):
+                    sig_c = self._pattern_c_quiet_long(idx, candle)
+                    if sig_c:
+                        return sig_c, next_cache
+                return None, next_cache
             ratio = self._vol_ratio_single(idx)
         else:
             ratio = self._vol_ratio_single(idx)
             if ratio < momentum_thr:
-                return None, self._build_next_cache(idx)
+                next_cache = self._build_next_cache(idx)
+                # スパイク閾値未満 → Pattern C を確認
+                if self.cfg.get("quiet_long_enabled", True):
+                    sig_c = self._pattern_c_quiet_long(idx, candle)
+                    if sig_c:
+                        return sig_c, next_cache
+                return None, next_cache
 
-        # --- パターン判定 ---
+        # --- パターン判定 (スパイクあり) ---
         # reversal_threshold 以上 → Pattern A (reversal LONG)
         # momentum_threshold 以上 & reversal_threshold 未満 → Pattern B (momentum SHORT)
         if ratio >= reversal_thr:
@@ -260,6 +306,101 @@ class EthRubberBand(BaseStrategy):
             entry, sl_price, sl_dist * 100, cut_bars,
         )
         return signal, next_cache
+
+    def _pattern_c_quiet_long(self, idx: int, candle: dict) -> dict | None:
+        """Pattern C: 低出来高 + GOLDEN クロス + 4H底値圏 → LONG (quiet_long)。
+
+        スパイクが出ない静かな市場で機能する代替戦略。
+        30日BT (n=22): WR=68.2%, EV=+0.179%, 約1件/日
+
+        条件:
+          1. EMA9 > EMA21 (GOLDEN クロス: 短期上昇トレンド)
+          2. 4H range pos < quiet_long_h4_max_pct (底値圏: デフォルト35%)
+          3. 直近N本/長期M本 出来高比 < quiet_long_vol_ratio_max (低出来高: デフォルト0.60)
+        """
+        h4_window = self.cfg["h4_window"]
+        h4_max_pct = self.cfg.get("quiet_long_h4_max_pct", 35)
+        vol_ratio_max = self.cfg.get("quiet_long_vol_ratio_max", 0.60)
+        short_w = self.cfg.get("quiet_long_vol_short_window", 5)
+        long_w = self.cfg.get("quiet_long_vol_long_window", 100)
+        tp_pct = self.cfg.get("quiet_long_tp_pct", 0.004)
+        sl_pct = self.cfg.get("quiet_long_sl_pct", 0.006)
+        cut_bars = self.cfg.get("quiet_long_cut_bars", 10)
+
+        # 1. EMA クロス確認 (GOLDEN: EMA9 > EMA21)
+        if idx < 21:
+            return None
+        closes = [c["c"] for c in self.candles[max(0, idx - 30):idx + 1]]
+        if len(closes) < 22:
+            return None
+        # EMA計算 (直近30本のみ: 近似十分)
+        def _ema(prices: list[float], period: int) -> float:
+            k = 2.0 / (period + 1)
+            e = prices[0]
+            for p in prices[1:]:
+                e = p * k + e * (1 - k)
+            return e
+
+        ema9 = _ema(closes, 9)
+        ema21 = _ema(closes, 21)
+        if ema9 <= ema21:
+            return None
+
+        # 2. 4H range position (底値圏チェック)
+        h4_low, h4_high = self._h4_range(idx - 1, h4_window)
+        entry = candle["c"]
+        pos = self._range_position(entry, h4_low, h4_high)
+        if pos >= h4_max_pct:
+            return None
+
+        # 3. 低出来高チェック (直近N本/長期M本 < 閾値)
+        short_start = max(0, idx - short_w + 1)
+        short_vols = [self.candles[j]["v"] for j in range(short_start, idx + 1)]
+        long_start = max(0, idx - long_w + 1)
+        long_vols = [self.candles[j]["v"] for j in range(long_start, idx + 1)]
+        short_avg = sum(short_vols) / len(short_vols) if short_vols else 0
+        long_avg = sum(long_vols) / len(long_vols) if long_vols else 0
+        if long_avg <= 0:
+            return None
+        vol_ratio = short_avg / long_avg
+        if vol_ratio >= vol_ratio_max:
+            return None
+
+        tp_price = round(entry * (1 + tp_pct), 2)
+        sl_price = round(entry * (1 - sl_pct), 2)
+
+        logger.info(
+            "Pattern C (quiet_long): ema9=%.2f > ema21=%.2f, pos=%.1f%% < %d%%, "
+            "vol_ratio(5/100)=%.2f < %.2f → LONG TP %.1f%% SL %.1f%%",
+            ema9, ema21, pos, h4_max_pct, vol_ratio, vol_ratio_max,
+            tp_pct * 100, sl_pct * 100,
+        )
+
+        signal = {
+            "symbol": "ETH",
+            "action": "long",
+            "direction": "long",
+            "confidence": 0.75,
+            "entry_price": round(entry, 2),
+            "take_profit": tp_price,
+            "stop_loss": sl_price,
+            "leverage": 3,
+            "reasoning": (
+                f"EthRubberBand C: quiet_long, ema9={ema9:.2f}>ema21={ema21:.2f}, "
+                f"4H_pos={pos:.1f}%, vol_ratio(5/100)={vol_ratio:.2f}, "
+                f"→ LONG TP {tp_pct*100:.1f}% SL {sl_pct*100:.1f}% {cut_bars}bar cut"
+            ),
+            "zone": "quiet_bottom",
+            "pattern": "C_quiet_long",
+            "exit_mode": "time_cut",
+            "exit_bars": cut_bars,
+            "range_position": round(pos, 1),
+            "vol_ratio": round(vol_ratio, 2),
+            "spike_time": candle["t"],
+        }
+        logger.info("Signal: long ETH @ %.2f, TP=%.2f, SL=%.2f (quiet_long, exit=%dbar)",
+                    entry, tp_price, sl_price, cut_bars)
+        return signal
 
     def _vol_ratio_single(self, idx: int) -> float:
         """単一足の出来高比率。O(window)。"""
