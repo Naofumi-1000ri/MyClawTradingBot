@@ -10,9 +10,11 @@ hyperliquid:
 
 # Strategy (ゴム理論ベース、ルールベース)
 strategy:
-  rubber_wall:                   # BTC: BEAR spike → SHORT (ゴムの壁)
+  rubber_wall:                   # BTC: BEAR spike → zone判定 (ゴムの壁)
     symbol: "BTC"
     vol_threshold: 5.0           # 旧7.0→5.0: upper 77%勝率 (30日BTデータ), 機会損失削減
+                                 # zones: penetration(-20~0%→LONG), upper_range(40%~→SHORT)
+                                 # upper_range TP=0.5%/SL=0.6% (旧TP=0.3%。EV -0.069%→+0.049%)
     h4_window: 48
     vol_window: 288
     timeout_candles: 5

@@ -8,9 +8,10 @@
 
 ゾーン:
   貫通    (-20% ~ 0%):   LONG   TP 0.3%  SL 0.6% (30日分 vol>=5x: LONG_wr=55%, PF=2.33)
-  レンジ上  (20% ~):       SHORT  TP 0.3%  (30日分 vol>=5x: SHORT_wr=59%, PF=2.06)
+  レンジ上  (40% ~):       SHORT  TP 0.5%  SL 0.6% (30日分 vol>=5x: SHORT_wr=59%, EV=+0.049%)
   深突破   (~ -20%):      SKIP   (LONG/SHORT 双方 30-40%。エッジ不明確のためSKIP)
   底付近   (0% ~ 20%):    SKIP   (SHORT_wr=55%だが現価格がレンジ底近傍でリスク高)
+  中間     (20% ~ 40%):   SKIP   (ゾーン下寄りでSHORT期待値が不明確。旧20~40%は廃止)
 
 2026-02-21 vol_threshold 7.0→5.0 変更:
   - 30日分バックテスト: vol>=5.0 BEAR spike のうち upper ゾーンで 59%勝率
@@ -25,6 +26,11 @@
 
 2026-02-21 deep_reversal SKIP 変更:
   - 旧LONG: 40%勝率でエッジ不明確。penetrationと合わせてSKIPに変更
+
+2026-02-21 upper_range 期待値改善:
+  - TP 0.3%→0.5%: 旧EV=-0.069%, 新EV=+0.049% (WR=59%前提)
+  - ゾーン開始: pos>=20%→pos>=40%: 中位ゾーン(20-40%)はSHORT期待値不明確なためSKIP
+  - 実運用シグナルログ: pos=33%でSHORTが1件発生。このケースをSKIPに変更
 """
 
 from __future__ import annotations
@@ -44,12 +50,15 @@ _DEFAULT_CONFIG = {
         # 30日BT BEAR spike>=5x: LONG_wr=55%, TP0.3%/SL0.6%でPF=2.33
         # BEARスパイク + 4Hレンジ下抜けは売り過剰 → 反転LONG
         "penetration": {"range": [-20, 0], "direction": "long", "tp_pct": 0.003, "sl_pct": 0.006},
-        # upper_range: SHORT維持
+        # upper_range: SHORT (pos>=40%のみ)
         # 30日BT BEAR spike>=5x: SHORT_wr=59%, avg=-0.321%
-        "upper_range": {"range": [20, 999], "direction": "short", "tp_pct": 0.003, "sl_pct": 0.006},
+        # TP 0.3%→0.5%: 旧EV=-0.069%→新EV=+0.049% (WR=59%前提)
+        # ゾーン開始 20%→40%: 中位ゾーン(20-40%)はSHORT期待値不明確なためSKIP
+        "upper_range": {"range": [40, 999], "direction": "short", "tp_pct": 0.005, "sl_pct": 0.006},
         # deep_reversal: SKIP (旧LONG: 30-40%勝率でエッジ不明確)
         # "deep_reversal": {"range": [-999, -20], "direction": "long", "tp_pct": 0.003},
-        # bottom (0~20): skip (SHORT_wr=55%だが現位置がレンジ底近傍でリスク高)
+        # bottom (0~20): SKIP (SHORT_wr=55%だが現位置がレンジ底近傍でリスク高)
+        # middle (20~40): SKIP (上昇中間帯でSHORT期待値不明確)
     },
 }
 
