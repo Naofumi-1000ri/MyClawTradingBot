@@ -14,6 +14,7 @@ from src.utils.config_loader import (
 )
 from src.utils.file_lock import atomic_write_json, read_json
 from src.utils.logger import setup_logger
+from src.utils.retry import RetryExhausted, call_with_retry, enter_safe_hold
 
 logger = setup_logger("data_collector")
 
@@ -88,9 +89,9 @@ def _fetch_funding_rates(info: Info) -> dict[str, float]:
 def _fetch_account_equity(info: Info, settings: dict) -> float:
     """Fetch account equity from Hyperliquid.
 
-    perps accountValue (marginSummary.accountValue) を正とする。
-    これにはマージン担保+未実現損益が含まれるため、最も信頼できる値。
-    spot USDC が perps 側に反映されていない場合のみ加算する。
+    統合口座(portfolio margin): spot USDC total + perps unrealized PnL。
+    標準口座(spot=0): perps accountValue をそのまま使用。
+    trade_executor._get_equity() と同一ロジック。
     """
     import requests as _req
     main_address = os.environ.get("HYPERLIQUID_MAIN_ADDRESS", "").strip()
@@ -111,14 +112,21 @@ def _fetch_account_equity(info: Info, settings: dict) -> float:
                 spot_usdc = float(b.get("total", 0))
                 break
 
-        # perps accountValue を正とする。
-        # 統合口座: perps_equity に spot 担保が既に含まれている。
-        # 標準口座: perps_equity がそのまま口座価値。
-        # spot のみ(perps=0): spot_usdc を使用。
-        if perps_equity > 0:
-            total = perps_equity
+        # 統合口座(portfolio margin): spot_usdc にマージン担保が含まれ、
+        # perps accountValue は担保を含まない(unrealized PnLのみ)。
+        # 正しい計算: spot_usdc + sum(perps unrealized PnL)
+        # 標準口座(spot=0): perps accountValue をそのまま使用。
+        total_upnl = 0.0
+        for p in state.get("assetPositions", []):
+            total_upnl += float(p.get("position", {}).get("unrealizedPnl", 0))
+
+        if spot_usdc > 0:
+            # 統合口座: spot に担保、perps_equity が負 (含み損) でも正しく反映
+            total = spot_usdc + total_upnl
+        elif perps_equity > 0:
+            total = perps_equity  # 標準口座
         else:
-            total = spot_usdc
+            total = 0.0
 
         if total > 0:
             logger.debug("Equity: perps_av=%.2f, spot=%.2f, total=%.2f",
@@ -142,7 +150,21 @@ def collect(settings: dict | None = None) -> dict:
     data_dir = get_data_dir(settings)
     output_path = data_dir / "market_data.json"
 
-    info = _build_info(settings)
+    # Info クライアント初期化 (最大2回リトライ)
+    try:
+        info = call_with_retry(
+            _build_info,
+            args=(settings,),
+            max_retries=2,
+            base_delay=3.0,
+            backoff_factor=2.0,
+            max_delay=15.0,
+            operation_name="Hyperliquid接続",
+        )
+    except RetryExhausted as e:
+        logger.critical("Hyperliquid接続リトライ上限超過: %s", e)
+        enter_safe_hold(f"data_collector: Hyperliquid接続失敗 (リトライ上限超過): {e.last_error}")
+        raise RuntimeError(f"Hyperliquid接続失敗: {e.last_error}") from e
 
     # Load previous data as fallback
     prev_data: dict = {}
@@ -151,17 +173,33 @@ def collect(settings: dict | None = None) -> dict:
     except (FileNotFoundError, Exception):
         pass
 
-    # Fetch shared data
+    # Fetch shared data (リトライ付き)
     try:
-        all_mids = _fetch_mid_prices(info)
-    except Exception as e:
-        logger.error("Failed to fetch mid prices: %s", e)
+        all_mids = call_with_retry(
+            _fetch_mid_prices,
+            args=(info,),
+            max_retries=2,
+            base_delay=2.0,
+            backoff_factor=2.0,
+            max_delay=10.0,
+            operation_name="mid価格取得",
+        )
+    except RetryExhausted as e:
+        logger.error("mid価格取得リトライ上限超過: %s", e)
         all_mids = {}
 
     try:
-        funding_rates = _fetch_funding_rates(info)
-    except Exception as e:
-        logger.error("Failed to fetch funding rates: %s", e)
+        funding_rates = call_with_retry(
+            _fetch_funding_rates,
+            args=(info,),
+            max_retries=2,
+            base_delay=2.0,
+            backoff_factor=2.0,
+            max_delay=10.0,
+            operation_name="資金調達率取得",
+        )
+    except RetryExhausted as e:
+        logger.error("資金調達率取得リトライ上限超過: %s", e)
         funding_rates = {}
 
     # Build per-symbol data
@@ -179,22 +217,40 @@ def collect(settings: dict | None = None) -> dict:
         else:
             mid_price = None
 
-        # Candles (3 timeframes)
+        # Candles (3 timeframes) - リトライ付き
         candles = {}
         for interval in ("15m", "1h", "4h"):
             key = f"candles_{interval}"
             try:
-                candles[key] = _fetch_candles(info, sym, interval)
+                fetched = call_with_retry(
+                    _fetch_candles,
+                    args=(info, sym, interval),
+                    max_retries=2,
+                    base_delay=2.0,
+                    backoff_factor=2.0,
+                    max_delay=10.0,
+                    operation_name=f"{sym} {interval}キャンドル取得",
+                )
+                candles[key] = fetched
                 logger.info("Fetched %d %s candles for %s", len(candles[key]), interval, sym)
-            except Exception as e:
-                logger.error("Failed to fetch %s candles for %s: %s", interval, sym, e)
+            except RetryExhausted as e:
+                logger.error("Failed to fetch %s candles for %s after retries: %s", interval, sym, e)
                 candles[key] = prev_sym.get(key, [])
 
-        # Orderbook
+        # Orderbook - リトライ付き
         try:
-            orderbook = _fetch_orderbook(info, sym, depth=orderbook_depth)
-        except Exception as e:
-            logger.error("Failed to fetch orderbook for %s: %s", sym, e)
+            orderbook = call_with_retry(
+                _fetch_orderbook,
+                args=(info, sym),
+                kwargs={"depth": orderbook_depth},
+                max_retries=2,
+                base_delay=2.0,
+                backoff_factor=2.0,
+                max_delay=10.0,
+                operation_name=f"{sym} オーダーブック取得",
+            )
+        except RetryExhausted as e:
+            logger.error("Failed to fetch orderbook for %s after retries: %s", sym, e)
             orderbook = prev_sym.get("orderbook", {"bids": [], "asks": []})
 
         # Funding rate
@@ -204,12 +260,21 @@ def collect(settings: dict | None = None) -> dict:
             if fr is not None:
                 logger.warning("Using previous funding_rate for %s", sym)
 
-        # 5m足追加取得 (ゴムの壁モデル + 将来のアルト分析用)
+        # 5m足追加取得 (ゴムの壁モデル + 将来のアルト分析用) - リトライ付き
         try:
-            candles["candles_5m"] = _fetch_candles(info, sym, "5m", 336)
+            fetched_5m = call_with_retry(
+                _fetch_candles,
+                args=(info, sym, "5m", 336),
+                max_retries=2,
+                base_delay=2.0,
+                backoff_factor=2.0,
+                max_delay=10.0,
+                operation_name=f"{sym} 5mキャンドル取得",
+            )
+            candles["candles_5m"] = fetched_5m
             logger.info("Fetched %d 5m candles for %s", len(candles["candles_5m"]), sym)
-        except Exception as e:
-            logger.error("Failed to fetch 5m candles for %s: %s", sym, e)
+        except RetryExhausted as e:
+            logger.error("Failed to fetch 5m candles for %s after retries: %s", sym, e)
             candles["candles_5m"] = prev_sym.get("candles_5m", [])
 
         symbols_data[sym] = {
@@ -238,8 +303,13 @@ def collect(settings: dict | None = None) -> dict:
             if sm is None:
                 from src.state.state_manager import StateManager
                 sm = StateManager()
-            api_unrealized = sum(float(p.get("unrealized_pnl", 0) or 0) for p in positions)
-            sm.update_daily_pnl(equity, api_unrealized_pnl=api_unrealized)
+            if positions:
+                # sync 成功時のみ unrealized を更新 (空リストで 0 上書きしない)
+                api_unrealized = sum(float(p.get("unrealized_pnl", 0) or 0) for p in positions)
+                sm.update_daily_pnl(equity, api_unrealized_pnl=api_unrealized)
+            else:
+                # sync 失敗 or ポジションなし — equity のみ更新
+                sm.update_daily_pnl(equity)
             logger.info("Equity updated: $%.2f", equity)
         except Exception as e:
             logger.warning("Failed to update daily_pnl: %s", e)

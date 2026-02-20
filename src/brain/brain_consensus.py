@@ -12,6 +12,7 @@ from src.brain.build_context import build_context
 from src.utils.config_loader import get_project_root, load_settings
 from src.utils.file_lock import atomic_write_json, read_json
 from src.utils.logger import setup_logger
+from src.utils.retry import RetryExhausted, call_with_retry, enter_safe_hold
 
 logger = setup_logger("brain_consensus")
 
@@ -511,34 +512,63 @@ def _sanitize_equity_in_context(context: dict) -> None:
 
 
 def main() -> None:
-    """メイン実行: コンテキスト構築 → ゴム戦略 (BTC+ETH+SOL) → 出力。"""
+    """メイン実行: コンテキスト構築 → ゴム戦略 (BTC+ETH+SOL) → 出力。
+
+    各フェーズはリトライ付きで実行される。
+    最大リトライ回数を超えた場合は安全なホールド状態に移行し、Telegramアラートを発報する。
+    """
     settings = load_settings()
     symbols = settings.get("trading", {}).get("symbols", ["BTC", "ETH"])
 
-    # 1. コンテキスト構築
-    logger.info("[1/2] Building context...")
+    # 1. コンテキスト構築 (最大2回リトライ: 計3回試行)
+    logger.info("[1/2] Building context (with retry)...")
+    context = None
     try:
-        context = build_context()
+        context = call_with_retry(
+            build_context,
+            max_retries=2,
+            base_delay=3.0,
+            backoff_factor=2.0,
+            max_delay=15.0,
+            operation_name="コンテキスト構築",
+        )
         context_path = ROOT / "data" / "context.json"
         atomic_write_json(context_path, context)
         logger.info("Context built: %s", context_path)
+    except RetryExhausted as e:
+        logger.error("Context build exhausted retries: %s", e)
+        _write_fallback_and_exit(symbols, f"コンテキスト構築失敗 (リトライ上限超過): {e.last_error}")
+        _track_agent_failure(failed=True)
+        enter_safe_hold(f"brain_consensus: コンテキスト構築リトライ上限超過 ({e.last_error})")
+        return
     except Exception as e:
         logger.error("Context build failed: %s", e)
         _write_fallback_and_exit(symbols, f"コンテキスト構築失敗: {e}")
-        # コンテキスト構築失敗も「全エージェント失敗」として計上
         _track_agent_failure(failed=True)
         return
 
     _sanitize_equity_in_context(context)
 
-    # 2. ゴム戦略 (BTC RubberWall + ETH RubberBand)
-    logger.info("[2/2] Running rubber strategies...")
+    # 2. ゴム戦略 (BTC RubberWall + ETH RubberBand) (最大2回リトライ: 計3回試行)
+    logger.info("[2/2] Running rubber strategies (with retry)...")
     try:
-        _run_rubber_wall(settings, context)
+        call_with_retry(
+            _run_rubber_wall,
+            args=(settings, context),
+            max_retries=2,
+            base_delay=3.0,
+            backoff_factor=2.0,
+            max_delay=15.0,
+            operation_name="ゴム戦略",
+        )
+    except RetryExhausted as e:
+        logger.error("Rubber strategy exhausted retries: %s", e)
+        _write_fallback_and_exit(symbols, f"ゴム戦略クラッシュ (リトライ上限超過): {e.last_error}")
+        _track_agent_failure(failed=True)
+        enter_safe_hold(f"brain_consensus: ゴム戦略リトライ上限超過 ({e.last_error})")
     except Exception as e:
         logger.error("Rubber strategy crashed: %s", e)
         _write_fallback_and_exit(symbols, f"ゴム戦略クラッシュ: {e}")
-        # ゴム戦略クラッシュも「全エージェント失敗」として計上
         _track_agent_failure(failed=True)
 
 
