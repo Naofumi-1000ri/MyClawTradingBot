@@ -20,11 +20,15 @@ SOL 固有のボラティリティに合わせた広いTP/SL設定。
     理由: -2e-5 は中程度のネガティブfundingでもSHORTブロックしすぎ。
     -5e-5 (=極端なスクイーズリスク域) のみブロックに変更してSOL機会損失を削減。
 
+2026-02-21 ゾーン精度改善:
+  - upper_range 下限 20%→40%: pos=20-40%のグレーゾーン (ボトム近傍) を排除
+    理由: pos=39.9%でのSHORT (vol=8.0x) がSLヒット。ボトム寄りでのSHORTは逆行リスク高い
+
 ゾーン:
   貫通    (-20% ~ 0%):    SHORT  TP 1.5%  SL 0.8% (最強ゾーン: 62-71% win)
-  レンジ上 (20% ~):        SHORT  TP 1.2%  SL 0.6%
+  レンジ上 (40% ~):        SHORT  TP 1.2%  SL 0.6% (旧20%→40%: グレーゾーン排除)
   深突破   (~ -20%):       LONG   TP 0.8%  SL 0.5% (反転。7x+ threshold)
-  底付近   (0% ~ 20%):     SKIP
+  底付近   (0% ~ 40%):     SKIP  (0-20%: ボトム, 20-40%: グレーゾーン)
 """
 
 from __future__ import annotations
@@ -46,7 +50,8 @@ _DEFAULT_CONFIG = {
         # penetration: SL 0.5%→0.8% (5分足ノイズ耐性強化), TP 1.0%→1.5% (R:R≈1.875)
         "penetration": {"range": [-20, 0], "direction": "short", "tp_pct": 0.015, "sl_pct": 0.008},
         # upper_range: SL 0.4%→0.6%, TP 0.8%→1.2%
-        "upper_range": {"range": [20, 999], "direction": "short", "tp_pct": 0.012, "sl_pct": 0.006},
+        # 下限 20%→40%: 4H 20-40% のグレーゾーン (ボトム近傍) でのSHORTは逆行リスク高い
+        "upper_range": {"range": [40, 999], "direction": "short", "tp_pct": 0.012, "sl_pct": 0.006},
         # deep_reversal: LONG は据え置き (SL 0.5% はLONG時は反対方向なので問題なし)
         "deep_reversal": {"range": [-999, -20], "direction": "long", "tp_pct": 0.008, "sl_pct": 0.005},
         # bottom (0~20): skip
