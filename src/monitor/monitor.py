@@ -145,7 +145,14 @@ def run_monitor() -> None:
         except Exception:
             logger.exception("Risk limit check failed")
 
-    # 5. Send alerts if any
+    # 5. パフォーマンス分析 (毎回実行、保存あり)
+    try:
+        from src.monitor.performance_tracker import run_analysis
+        run_analysis(save_report=True)
+    except Exception:
+        logger.exception("Performance analysis failed")
+
+    # 6. Send alerts if any
     if alerts:
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         text = f"*myClaw Alert* ({now})\n" + "\n".join(f"- {a}" for a in alerts)
