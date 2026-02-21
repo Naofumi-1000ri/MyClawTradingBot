@@ -314,6 +314,50 @@ def _has_eth_rubber_position() -> bool:
     return _has_rubber_position("ETH")
 
 
+def _compute_btc_atr_ratio(
+    sym_data: dict,
+    short_window: int = 24,
+    long_window: int = 288,
+) -> tuple[float, str]:
+    """5m candles から短期/長期ATR比率を計算する (WaveRider 適応型SL用)。
+
+    Args:
+        sym_data: context["market_data"]["BTC"]
+        short_window: 短期ATR窓 (デフォルト24本 = 2h)
+        long_window: 長期ATR窓 (デフォルト288本 = 24h)
+
+    Returns:
+        (atr_ratio, label)
+          atr_ratio: short_atr / long_atr (高ボラ>1 / 低ボラ<1)
+          label: "high_vol" / "low_vol" / "normal"
+    """
+    candles = sym_data.get("candles_5m", [])
+    if not candles or len(candles) < short_window:
+        return 1.0, "normal"
+
+    def _atr(chunk: list) -> float:
+        total = sum(float(c.get("h", 0)) - float(c.get("l", 0)) for c in chunk)
+        return total / len(chunk) if chunk else 0.0
+
+    short_chunk = candles[-short_window:]
+    long_chunk = candles[-long_window:] if len(candles) >= long_window else candles
+
+    short_atr = _atr(short_chunk)
+    long_atr = _atr(long_chunk)
+
+    if long_atr <= 0 or short_atr <= 0:
+        return 1.0, "normal"
+
+    ratio = short_atr / long_atr
+    if ratio > 1.5:
+        label = "high_vol"
+    elif ratio < 0.7:
+        label = "low_vol"
+    else:
+        label = "normal"
+    return ratio, label
+
+
 def _run_wave_rider_btc(settings: dict, context: dict) -> list[dict]:
     """Wave Rider BTC: US Open 1h bar momentum + post-session reversion.
 
@@ -434,13 +478,38 @@ def _run_wave_rider_btc(settings: dict, context: dict) -> list[dict]:
                 return signals
 
             # Holding — not SL, not time stop
-            logger.info("WaveRider BTC: holding %s (%s) mid=%.2f SL=%.2f", direction, pattern, mid_price, sl_price)
+            # Adaptive SL: compute volatility-adaptive trailing stop
+            entry_price = float(meta.get("entry_price", 0) or mid_price)
+            atr_ratio, vol_label = _compute_btc_atr_ratio(sym_data)
+            new_sl, adapt_label = wr.compute_adaptive_sl(
+                entry_price, mid_price, sl_price, direction, atr_ratio
+            )
+            sl_updated = False
+            if abs(new_sl - sl_price) > 0.01:
+                meta["stop_loss"] = new_sl
+                STATE_DIR.mkdir(parents=True, exist_ok=True)
+                atomic_write_json(meta_path, meta)
+                sl_updated = True
+                logger.info(
+                    "WaveRider BTC: adaptive SL updated %s %.2f→%.2f (%s, atr_ratio=%.2f)",
+                    direction, sl_price, new_sl, adapt_label, atr_ratio,
+                )
+                sl_price = new_sl
+
+            logger.info(
+                "WaveRider BTC: holding %s (%s) mid=%.2f SL=%.2f [%s%s]",
+                direction, pattern, mid_price, sl_price, adapt_label,
+                " SL_updated" if sl_updated else "",
+            )
             return [{
                 "symbol": "BTC",
                 "action": "hold_position",
                 "direction": "hold_position",
                 "confidence": 1.0,
-                "reasoning": f"WaveRider holding ({pattern}): mid={mid_price:.2f}, SL={sl_price:.2f}",
+                "reasoning": (
+                    f"WaveRider holding ({pattern}): mid={mid_price:.2f}, SL={sl_price:.2f} "
+                    f"[adaptive: {adapt_label}]"
+                ),
                 "zone": "holding",
                 "pattern": pattern,
             }]
@@ -502,14 +571,33 @@ def _run_wave_rider_btc(settings: dict, context: dict) -> list[dict]:
                     pass
                 return signals
 
-            # Holding reversion
-            logger.info("WaveRider REV: holding SHORT (%s) mid=%.2f SL=%.2f TP=%.2f", pattern, mid_price, sl_price, tp_price)
+            # Holding reversion — adaptive SL for SHORT
+            rev_entry_price = float(meta.get("entry_price", 0) or mid_price)
+            atr_ratio, _vol_label = _compute_btc_atr_ratio(sym_data)
+            new_sl, adapt_label = wr.compute_adaptive_sl(
+                rev_entry_price, mid_price, sl_price, "short", atr_ratio
+            )
+            if abs(new_sl - sl_price) > 0.01:
+                meta["stop_loss"] = new_sl
+                STATE_DIR.mkdir(parents=True, exist_ok=True)
+                atomic_write_json(meta_path, meta)
+                logger.info(
+                    "WaveRider REV: adaptive SL updated %.2f→%.2f (%s)",
+                    sl_price, new_sl, adapt_label,
+                )
+                sl_price = new_sl
+
+            logger.info("WaveRider REV: holding SHORT (%s) mid=%.2f SL=%.2f TP=%.2f [%s]",
+                        pattern, mid_price, sl_price, tp_price, adapt_label)
             return [{
                 "symbol": "BTC",
                 "action": "hold_position",
                 "direction": "hold_position",
                 "confidence": 1.0,
-                "reasoning": f"WaveRider REV holding ({pattern}): mid={mid_price:.2f}, SL={sl_price:.2f}, TP={tp_price:.2f}",
+                "reasoning": (
+                    f"WaveRider REV holding ({pattern}): mid={mid_price:.2f}, "
+                    f"SL={sl_price:.2f}, TP={tp_price:.2f} [adaptive: {adapt_label}]"
+                ),
                 "zone": "holding",
                 "pattern": pattern,
             }]
