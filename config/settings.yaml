@@ -15,7 +15,7 @@ strategy:
     vol_threshold: 5.0           # 旧7.0→5.0: upper 77%勝率 (30日BTデータ), 機会損失削減
                                  # zones: penetration(-20~0%→LONG), upper_range(40%~→SHORT)
                                  # upper_range TP=0.5%/SL=0.6% (旧TP=0.3%。EV -0.069%→+0.049%)
-    quiet_long_enabled: true     # Pattern D 有効 (BT根拠: n=13, avg+0.32%上昇)
+    quiet_long_enabled: false    # Pattern D 無効 (ISSUE-001: quiet系は出来高なしエントリー、ゴム理論の趣旨と矛盾)
     h4_window: 48
     vol_window: 288
     timeout_candles: 5
@@ -37,7 +37,7 @@ strategy:
     # Pattern C: quiet_long (静観脱却 - 2026-02-21追加)
     # スパイク不要。低出来高+GOLDEN+4H中位以下 → LONG
     # 30日BT n=22: WR=68.2%, EV=+0.179%, 約1.5件/日 (h4_max_pct緩和後)
-    quiet_long_enabled: true          # Pattern C 再有効化 (実績3件: loss=1件,BE=1件,open=1件。統計不十分で誤無効化)
+    quiet_long_enabled: false         # Pattern C 無効 (ISSUE-001: quiet系は出来高なしエントリー、ゴム理論の趣旨と矛盾。本番全敗確認)
     quiet_long_h4_max_pct: 45         # 4H pos < 45% (旧50%→45%: 直近BTで40-50%ゾーンはtimeoutが多くEV低下確認)
     quiet_long_vol_ratio_max: 0.50    # 直近5本/100本平均 < 0.50 (旧0.60→0.50: 0.59ギリギリケースを除外し品質向上)
     quiet_long_vol_short_window: 5    # 直近N本の出来高平均
@@ -48,11 +48,31 @@ strategy:
     quiet_long_use_4h_ema: true       # 5m DEAD でも 4H EMA GOLDEN なら発火許可 (confidence=0.72)
     h4_window: 48
     vol_window: 288
+  wave_rider:                    # BTC: US Open 1h bar momentum (208日BT: PF=1.68, Sharpe=3.13)
+    symbol: "BTC"
+    enabled: true
+    up_large_th: 0.006           # >=+0.6% → LONG (momentum follow)
+    down_large_th: 0.008         # <=-0.8% → SHORT (momentum follow)
+    up_medium_th: 0.002          # +0.2-0.6% → SHORT (fade)
+    sl_pct: 0.008                # SL 0.8% (全パターン共通)
+    reversion_enabled: true      # up_large後のリバージョンSHORT
+    rev_tp_pct: 0.003            # REV TP 0.3% (19件WR=94.7%, p=0.008)
+    rev_sl_pct: 0.008            # REV SL 0.8%
+    rev_deviation_th: 0.008      # 乖離率>=0.8%で発動
+  wave_rider_hype:               # HYPE: 木曜限定 US Open WR (BTC低相関ヘッジ, r=-0.82)
+    symbol: "HYPE"
+    enabled: true
+    thursday_only: true          # 木曜のみ稼働 (N=5, WR=80%, PF=21.5, BTC木曜PnL相関r=-0.82)
+    up_large_th: 0.030           # >=+3.0% → LONG (HYPE閾値はBTCの5倍)
+    down_large_th: 0.030         # <=-3.0% → SHORT
+    up_medium_th: 0.005          # +0.5-3.0% → SHORT (fade, 主力パターン)
+    sl_pct: 0.008                # SL 0.8%
+    reversion_enabled: false     # HYPEリバージョンは未検証
   sol_rubber_wall:               # SOL: BTC型ゴムの壁 (BEAR spike → SHORT メイン)
     symbol: "SOL"
     vol_threshold: 5.5           # 旧6.5→5.5: 6.5xは機会が少なすぎ。5.5xで頻度増加 (静観脱却)
     deep_threshold: 7.0          # deep_below LONG: 7x+ 高閾値 (deep_reversalは一時無効化中)
-    quiet_short_enabled: true    # Pattern E 有効 (BT根拠: n=76, WR=40.8%, PF=2.91, h4_min_pct=70%に緩和)
+    quiet_short_enabled: false   # Pattern E 無効 (ISSUE-001: SOL 57件 PF=0.11 本番全敗。出来高なしエントリーはゴム理論と矛盾)
     h4_window: 48
     vol_window: 288
 
@@ -62,6 +82,7 @@ trading:
     - "BTC"
     - "ETH"
     - "SOL"
+    - "HYPE"
   default_leverage: 3
   max_leverage: 10
   min_confidence: 0.7

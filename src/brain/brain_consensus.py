@@ -762,6 +762,195 @@ def _run_wave_rider_btc(settings: dict, context: dict) -> list[dict]:
     return signals
 
 
+def _run_wave_rider_hype(settings: dict, context: dict) -> list[dict]:
+    """Wave Rider HYPE: 木曜限定 US Open 1h bar momentum (BTC低相関ヘッジ).
+
+    BTC木曜WRとのPnL相関 r=-0.82。BTC負け時にHYPE勝ちのヘッジ構造。
+    リバージョンなし。Adaptive SLなし（シンプル運用）。
+
+    State: state/hype_wave_rider_meta.json
+    """
+    wr_config = settings.get("strategy", {}).get("wave_rider_hype", {})
+    if not wr_config.get("enabled", False):
+        return []
+
+    now = datetime.now(timezone.utc)
+    hour = now.hour
+    weekday = now.weekday()
+
+    # 木曜限定チェック (新規エントリー時のみ。保有中は毎日監視)
+    thursday_only = wr_config.get("thursday_only", True)
+
+    wr = WaveRider(wr_config)
+    signals = []
+
+    sym_data = context.get("market_data", {}).get("HYPE", {})
+    mid_price = float(sym_data.get("mid_price", 0) or 0)
+    if mid_price <= 0:
+        logger.warning("WaveRider HYPE: no mid price, skipping")
+        return []
+
+    meta_path = STATE_DIR / "hype_wave_rider_meta.json"
+    meta = _load_json_safe(meta_path)
+    if not isinstance(meta, dict) or not meta.get("phase"):
+        meta = None
+
+    # ── 1. Exit monitoring (既存ポジション) ──
+    if meta and meta.get("phase") == "wave_rider":
+        sl_price = float(meta.get("stop_loss", 0))
+        direction = meta.get("direction", "long")
+        pattern = meta.get("pattern", "unknown")
+
+        # SL check
+        if direction == "long" and mid_price <= sl_price:
+            logger.info("WaveRider HYPE: SL hit %s mid=%.4f <= SL=%.4f", direction, mid_price, sl_price)
+            signals.append({
+                "symbol": "HYPE", "action": "close", "direction": "close",
+                "confidence": 1.0,
+                "reasoning": f"WaveRider HYPE SL hit ({pattern}): mid={mid_price:.4f} vs SL={sl_price:.4f}",
+                "zone": "exit", "pattern": pattern,
+            })
+            try:
+                meta_path.unlink()
+            except FileNotFoundError:
+                pass
+            return signals
+
+        if direction == "short" and mid_price >= sl_price:
+            logger.info("WaveRider HYPE: SL hit %s mid=%.4f >= SL=%.4f", direction, mid_price, sl_price)
+            signals.append({
+                "symbol": "HYPE", "action": "close", "direction": "close",
+                "confidence": 1.0,
+                "reasoning": f"WaveRider HYPE SL hit ({pattern}): mid={mid_price:.4f} vs SL={sl_price:.4f}",
+                "zone": "exit", "pattern": pattern,
+            })
+            try:
+                meta_path.unlink()
+            except FileNotFoundError:
+                pass
+            return signals
+
+        # Time stop: hour >= 20
+        if hour >= 20:
+            logger.info("WaveRider HYPE: time stop (%s) at hour=%d, mid=%.4f", pattern, hour, mid_price)
+            signals.append({
+                "symbol": "HYPE", "action": "close", "direction": "close",
+                "confidence": 1.0,
+                "reasoning": f"WaveRider HYPE time stop ({pattern}): hour={hour}, mid={mid_price:.4f}",
+                "zone": "exit", "pattern": pattern,
+            })
+            try:
+                meta_path.unlink()
+            except FileNotFoundError:
+                pass
+            return signals
+
+        # Holding
+        logger.info(
+            "WaveRider HYPE: holding %s (%s) mid=%.4f SL=%.4f",
+            direction, pattern, mid_price, sl_price,
+        )
+        return [{
+            "symbol": "HYPE", "action": "hold_position", "direction": "hold_position",
+            "confidence": 1.0,
+            "reasoning": f"WaveRider HYPE holding ({pattern}): mid={mid_price:.4f}, SL={sl_price:.4f}",
+            "zone": "holding", "pattern": pattern,
+        }]
+
+    # ── 2. New entry (木曜, hour == 15, no meta) ──
+    if meta:
+        return []
+
+    if weekday >= 5:
+        logger.info("WaveRider HYPE: weekend (weekday=%d), skip", weekday)
+        return []
+
+    if thursday_only and weekday != 3:
+        return []
+
+    if hour != 15:
+        return []
+
+    # Find the UTC 14:00-15:00 1h candle
+    candles_1h = sym_data.get("candles_1h", [])
+    if not candles_1h:
+        logger.warning("WaveRider HYPE: no 1h candles available")
+        return []
+
+    observe_bar = None
+    for c in candles_1h:
+        bar_time = c.get("t") or c.get("time") or c.get("timestamp")
+        if bar_time is None:
+            continue
+        if isinstance(bar_time, str):
+            try:
+                bt = datetime.fromisoformat(bar_time.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+        else:
+            bt = datetime.fromtimestamp(int(bar_time) / 1000, tz=timezone.utc)
+        if bt.hour == 14 and bt.date() == now.date():
+            observe_bar = c
+            break
+
+    if observe_bar is None:
+        logger.info("WaveRider HYPE: UTC 14:00 bar not found in 1h candles")
+        return []
+
+    bar_open = float(observe_bar.get("o") or observe_bar.get("open", 0))
+    bar_close = float(observe_bar.get("c") or observe_bar.get("close", 0))
+    if bar_open <= 0 or bar_close <= 0:
+        logger.warning("WaveRider HYPE: invalid bar OHLC (open=%.4f, close=%.4f)", bar_open, bar_close)
+        return []
+
+    open_move = (bar_close - bar_open) / bar_open
+    result = wr.decide_entry(open_move)
+
+    if result is None:
+        logger.info("WaveRider HYPE: open_move=%.4f (%.2f%%), no entry", open_move, open_move * 100)
+        return []
+
+    direction, pattern, confidence = result
+    entry_price = mid_price
+    sl_price = wr.compute_sl(entry_price, direction)
+
+    logger.info(
+        "WaveRider HYPE: ENTRY %s (%s) open_move=%.4f (%.2f%%), entry=%.4f, SL=%.4f",
+        direction, pattern, open_move, open_move * 100, entry_price, sl_price,
+    )
+
+    signals.append({
+        "symbol": "HYPE", "action": direction, "direction": direction,
+        "confidence": confidence,
+        "entry_price": entry_price,
+        "stop_loss": sl_price,
+        "leverage": 3,
+        "reasoning": (
+            f"WaveRider HYPE entry ({pattern}): open_move={open_move:.4f} ({open_move * 100:.2f}%), "
+            f"entry={entry_price:.4f}, SL={sl_price:.4f}"
+        ),
+        "zone": "wave_rider",
+        "pattern": pattern,
+    })
+
+    # Write meta
+    wr_meta = {
+        "phase": "wave_rider",
+        "pattern": pattern,
+        "direction": direction,
+        "entry_price": entry_price,
+        "stop_loss": sl_price,
+        "observe_bar_open": bar_open,
+        "observe_bar_close": bar_close,
+        "entry_time": now.isoformat(),
+    }
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(meta_path, wr_meta)
+    _log_rubber_signal(signals[-1])
+
+    return signals
+
+
 def _run_rubber_wall(settings: dict, context: dict) -> bool:
     """ゴム戦略実行。BTC RubberWall + ETH RubberBand + SOL RubberWall を並列スキャン。
 
@@ -772,12 +961,13 @@ def _run_rubber_wall(settings: dict, context: dict) -> bool:
         True=スキャン完全失敗 (全銘柄データ不足), False=少なくとも1銘柄スキャン完了。
     """
     # ──────────────────────────────────────────────────────────
-    # 2026-02-21: ゴム戦略 新規エントリー全停止
-    # - 本番14件全敗 (ISSUE-001)、Wave Rider移行準備のため
-    # - 既存ポジションのexit管理のみ継続 (SL/TP/time_cut)
-    # - 復帰判断は3ヶ月後、5m足長期データ蓄積後
+    # 2026-02-21: ゴム戦略 スパイク系のみ復帰
+    # - ISSUE-001対処: quiet系 (スパイクなしエントリー) は config で無効化済み
+    #   (quiet_long_enabled: false, quiet_short_enabled: false)
+    # - スパイク検知ベースの本来のゴム理論は継続稼働
+    # - Wave Rider (BTC/HYPE) は時間ベースで独立稼働
     # ──────────────────────────────────────────────────────────
-    RUBBER_NEW_ENTRY_ENABLED = False
+    RUBBER_NEW_ENTRY_ENABLED = True
 
     from src.strategy.btc_rubber_wall import BtcRubberWall
     from src.strategy.eth_rubber_band import EthRubberBand
@@ -839,6 +1029,13 @@ def _run_rubber_wall(settings: dict, context: dict) -> bool:
     signals_list.extend(wr_signals)
     if wr_signals:
         logger.info("WaveRider BTC: %d signal(s) emitted", len(wr_signals))
+
+    # --- HYPE Wave Rider (木曜限定ヘッジ) ---
+    # BTC木曜WRとPnL相関 r=-0.82。独自meta (hype_wave_rider_meta.json) を使用
+    hype_wr_signals = _run_wave_rider_hype(settings, context)
+    signals_list.extend(hype_wr_signals)
+    if hype_wr_signals:
+        logger.info("WaveRider HYPE: %d signal(s) emitted", len(hype_wr_signals))
 
     # --- ETH RubberBand ---
     # 1) 既存ポジションの exit 監視 (SL/TP/時間カット)
