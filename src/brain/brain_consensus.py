@@ -26,6 +26,13 @@ _AGENT_FAILURE_THRESHOLD = 3
 _AGENT_FAILURE_STATE_PATH = STATE_DIR / "agent_failure_count.json"
 _JOURNAL_DIR = ROOT / "journal"
 
+# Rubber fallback 継続時間追跡
+# 「スパイクなし静観」が続いた時間を監視し、30分超でパラメータを自動緩和
+_FALLBACK_TRACKER_PATH = STATE_DIR / "fallback_tracker.json"
+_FALLBACK_ADJUST_THRESHOLD_MIN = 30   # 30分超でパラメータ緩和 (6サイクル = 30分)
+_FALLBACK_ADJUST_THRESHOLD_EXT = 60   # 60分超で追加緩和 + Telegram通知
+_CYCLE_MINUTES = 5                     # 1サイクル = 5分
+
 
 def _track_agent_failure(failed: bool) -> None:
     """全戦略スキャン失敗を追跡し、3回連続失敗時にアラートを発行する。
@@ -399,6 +406,19 @@ def _run_wave_rider_btc(settings: dict, context: dict) -> list[dict]:
     if not isinstance(meta, dict) or not meta.get("phase"):
         meta = None
 
+    # meta があるが実ポジションがない → 幽霊meta削除
+    if meta:
+        positions = _load_json_safe(STATE_DIR / "positions.json")
+        if isinstance(positions, list):
+            has_btc_pos = any(p.get("symbol") == "BTC" for p in positions)
+            if not has_btc_pos:
+                logger.warning("WaveRider BTC: meta exists but no BTC position — clearing stale meta")
+                try:
+                    meta_path.unlink()
+                except FileNotFoundError:
+                    pass
+                meta = None
+
     # ── 1. Exit monitoring (existing position) ──
     if meta:
         phase = meta["phase"]
@@ -453,10 +473,8 @@ def _run_wave_rider_btc(settings: dict, context: dict) -> list[dict]:
                     observe_open = float(meta.get("observe_bar_open", 0))
                     if observe_open > 0 and wr.should_trigger_reversion(observe_open, mid_price):
                         deviation = (mid_price - observe_open) / observe_open
-                        entry_after = now.replace(minute=0, second=0, microsecond=0)
-                        # 15min delay from now to avoid entry cooldown
                         from datetime import timedelta
-                        entry_after = now + timedelta(minutes=15)
+                        entry_after = now + timedelta(minutes=15)  # cooldown回避
                         pending_data = {
                             "pattern": "wr_up_large_rev",
                             "us_close_price": mid_price,
@@ -606,7 +624,16 @@ def _run_wave_rider_btc(settings: dict, context: dict) -> list[dict]:
     pending = _load_json_safe(pending_path)
     if isinstance(pending, dict) and pending.get("entry_after"):
         entry_after = datetime.fromisoformat(pending["entry_after"])
-        if now >= entry_after:
+        from datetime import timedelta
+        max_valid = entry_after + timedelta(minutes=30)
+        if now > max_valid:
+            logger.warning("WaveRider REV: pending expired (was %s, now %s), discarding", entry_after, now)
+            try:
+                pending_path.unlink()
+            except FileNotFoundError:
+                pass
+            pending = None
+        elif now >= entry_after:
             # Emit reversion SHORT entry
             rev_sl = wr.compute_rev_sl(mid_price)
             rev_tp = wr.compute_rev_tp(mid_price)
@@ -795,6 +822,19 @@ def _run_wave_rider_hype(settings: dict, context: dict) -> list[dict]:
     if not isinstance(meta, dict) or not meta.get("phase"):
         meta = None
 
+    # meta があるが実ポジションがない → 幽霊meta削除
+    if meta:
+        positions = _load_json_safe(STATE_DIR / "positions.json")
+        if isinstance(positions, list):
+            has_hype_pos = any(p.get("symbol") == "HYPE" for p in positions)
+            if not has_hype_pos:
+                logger.warning("WaveRider HYPE: meta exists but no HYPE position — clearing stale meta")
+                try:
+                    meta_path.unlink()
+                except FileNotFoundError:
+                    pass
+                meta = None
+
     # ── 1. Exit monitoring (既存ポジション) ──
     if meta and meta.get("phase") == "wave_rider":
         sl_price = float(meta.get("stop_loss", 0))
@@ -866,6 +906,7 @@ def _run_wave_rider_hype(settings: dict, context: dict) -> list[dict]:
         return []
 
     if thursday_only and weekday != 3:
+        logger.info("WaveRider HYPE: not Thursday (weekday=%d), skip", weekday)
         return []
 
     if hour != 15:
@@ -1371,12 +1412,30 @@ def main() -> None:
 
     _sanitize_equity_in_context(context)
 
+    # 2a. Rubber fallback 継続時間チェック → パラメータ自動調整
+    # fallback_tracker.json から前サイクルまでの継続サイクル数を読み込み、
+    # 30分超ならパラメータを緩和した settings コピーを生成。
+    try:
+        tracker_state = read_json(_FALLBACK_TRACKER_PATH)
+        if not isinstance(tracker_state, dict):
+            tracker_state = {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        tracker_state = {}
+
+    prev_consecutive = int(tracker_state.get("consecutive_fallback_cycles", 0))
+    if prev_consecutive > 0:
+        logger.info(
+            "[2a] FallbackTracker: prev consecutive fallback cycles = %d (%d min)",
+            prev_consecutive, prev_consecutive * _CYCLE_MINUTES,
+        )
+    settings_to_use = _get_fallback_adjusted_settings(settings, prev_consecutive)
+
     # 2. ゴム戦略 (BTC RubberWall + ETH RubberBand) (最大2回リトライ: 計3回試行)
     logger.info("[2/2] Running rubber strategies (with retry)...")
     try:
         all_scan_failed: bool = call_with_retry(
             _run_rubber_wall,
-            args=(settings, context),
+            args=(settings_to_use, context),
             max_retries=2,
             base_delay=3.0,
             backoff_factor=2.0,
@@ -1385,6 +1444,27 @@ def main() -> None:
         )
         # 正常完了: 戻り値で失敗/成功を判定
         _track_agent_failure(failed=all_scan_failed)
+
+        # fallback継続時間を追跡:
+        # - データ失敗 (all_scan_failed) は「静観継続」ではないためスキップ
+        # - signals.json を読んでシグナルが生成されたかを確認
+        if not all_scan_failed:
+            try:
+                sig_result = read_json(SIGNALS_DIR / "signals.json")
+                is_spike_fallback = (
+                    isinstance(sig_result, dict)
+                    and sig_result.get("action_type") == "hold"
+                    and not any(
+                        s.get("action") in ("close", "long", "short")
+                        for s in sig_result.get("signals", [])
+                    )
+                )
+            except Exception:
+                is_spike_fallback = False
+            _track_rubber_fallback(is_spike_fallback=is_spike_fallback)
+        else:
+            # データ不足サイクル: fallback trackerはリセットしない (中断として扱う)
+            logger.debug("FallbackTracker: skipping update (data failure cycle)")
     except RetryExhausted as e:
         logger.error("Rubber strategy exhausted retries: %s", e)
         _write_fallback_and_exit(symbols, f"ゴム戦略クラッシュ (リトライ上限超過): {e.last_error}")
@@ -1394,6 +1474,190 @@ def main() -> None:
         logger.error("Rubber strategy crashed: %s", e)
         _write_fallback_and_exit(symbols, f"ゴム戦略クラッシュ: {e}")
         _track_agent_failure(failed=True)
+
+
+def _track_rubber_fallback(is_spike_fallback: bool) -> int:
+    """「スパイクなし静観」の継続サイクル数を追跡する。
+
+    agent_failure (データ不足) とは別に、スパイクが検知されなかった場合のみカウント。
+    シグナルが生成された (trade/close) サイクルではリセット。
+
+    Args:
+        is_spike_fallback: True=スパイクなし静観, False=シグナル生成 or データ失敗
+
+    Returns:
+        現在の連続fallbackサイクル数 (is_spike_fallback=Falseならリセット後0)
+    """
+    try:
+        state = read_json(_FALLBACK_TRACKER_PATH)
+        if not isinstance(state, dict):
+            state = {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        state = {}
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    if not is_spike_fallback:
+        # シグナル生成成功 → リセット
+        prev = int(state.get("consecutive_fallback_cycles", 0))
+        if prev > 0:
+            elapsed_min = prev * _CYCLE_MINUTES
+            logger.info(
+                "FallbackTracker: reset after %d cycles (%d min) of spike-less fallback",
+                prev, elapsed_min,
+            )
+        state["consecutive_fallback_cycles"] = 0
+        state["fallback_started_at"] = None
+        state["last_signal_at"] = now_iso
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(_FALLBACK_TRACKER_PATH, state)
+        return 0
+
+    # スパイクなし → インクリメント
+    consecutive = int(state.get("consecutive_fallback_cycles", 0)) + 1
+    state["consecutive_fallback_cycles"] = consecutive
+    state["last_fallback_at"] = now_iso
+    if not state.get("fallback_started_at"):
+        state["fallback_started_at"] = now_iso
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(_FALLBACK_TRACKER_PATH, state)
+
+    elapsed_min = consecutive * _CYCLE_MINUTES
+    logger.info(
+        "FallbackTracker: %d consecutive fallback cycles (%d min elapsed)",
+        consecutive, elapsed_min,
+    )
+    return consecutive
+
+
+def _get_fallback_adjusted_settings(settings: dict, consecutive_cycles: int) -> dict:
+    """fallback継続時間に応じてシグナル生成パラメータを段階的に緩和した設定を返す。
+
+    元の settings を変更せず、コピーを返す。
+
+    段階:
+      Phase 1 (30-59分 = 6-11サイクル):
+        - BTC vol_threshold: 5.0 → 4.5 (-10%)
+        - ETH reversal_threshold: 7.0 → 6.0 (-14%)、momentum_low_vol_skip: True → False
+        - SOL vol_threshold: 5.0 → 4.5 (-10%)
+
+      Phase 2 (60分以上 = 12サイクル+):
+        - BTC vol_threshold: 4.5 → 4.0 (-20%合計)
+        - ETH reversal_threshold: 6.0 → 5.5 (-21%合計)
+        - SOL vol_threshold: 4.5 → 4.0 (-20%合計)
+        - Telegram通知
+
+    安全制約:
+      - vol_threshold の下限は 3.5x (極端な緩和を防止)
+      - quiet_long/quiet_short は変更しない (設定ファイルの意図を尊重)
+      - この関数はリスク制限 (risk_params.yaml) には一切触れない
+    """
+    elapsed_min = consecutive_cycles * _CYCLE_MINUTES
+
+    # フェーズ判定
+    if consecutive_cycles < 6:
+        # 30分未満: 調整なし
+        return settings
+
+    import copy
+    adjusted = copy.deepcopy(settings)
+    strategy = adjusted.setdefault("strategy", {})
+
+    if consecutive_cycles < 12:
+        # Phase 1: 30-59分
+        phase = 1
+        btc_vol = max(3.5, strategy.get("rubber_wall", {}).get("vol_threshold", 5.0) * 0.90)
+        eth_reversal = max(3.5, strategy.get("rubber_band", {}).get("reversal_threshold", 7.0) * 0.86)
+        sol_vol = max(3.5, strategy.get("sol_rubber_wall", {}).get("vol_threshold", 5.0) * 0.90)
+        eth_low_vol_skip = False
+    else:
+        # Phase 2: 60分以上
+        phase = 2
+        btc_vol = max(3.5, strategy.get("rubber_wall", {}).get("vol_threshold", 5.0) * 0.80)
+        eth_reversal = max(3.5, strategy.get("rubber_band", {}).get("reversal_threshold", 7.0) * 0.79)
+        sol_vol = max(3.5, strategy.get("sol_rubber_wall", {}).get("vol_threshold", 5.0) * 0.80)
+        eth_low_vol_skip = False
+
+    # BTC
+    rw = strategy.setdefault("rubber_wall", {})
+    orig_btc_vol = rw.get("vol_threshold", 5.0)
+    rw["vol_threshold"] = btc_vol
+
+    # ETH
+    rb = strategy.setdefault("rubber_band", {})
+    orig_eth_reversal = rb.get("reversal_threshold", 7.0)
+    orig_eth_skip = rb.get("momentum_low_vol_skip", True)
+    rb["reversal_threshold"] = eth_reversal
+    rb["momentum_low_vol_skip"] = eth_low_vol_skip
+
+    # SOL
+    srw = strategy.setdefault("sol_rubber_wall", {})
+    orig_sol_vol = srw.get("vol_threshold", 5.0)
+    srw["vol_threshold"] = sol_vol
+
+    logger.warning(
+        "FallbackAdjust Phase%d (%d min): "
+        "BTC vol %.1f→%.1f, ETH reversal %.1f→%.1f (low_vol_skip %s→%s), SOL vol %.1f→%.1f",
+        phase, elapsed_min,
+        orig_btc_vol, btc_vol,
+        orig_eth_reversal, eth_reversal,
+        orig_eth_skip, eth_low_vol_skip,
+        orig_sol_vol, sol_vol,
+    )
+
+    # Phase2: Telegram通知
+    if phase == 2:
+        try:
+            from src.monitor.telegram_notifier import send_message
+            send_message(
+                f"*FallbackAdjust Phase2*\n"
+                f"{elapsed_min}分間スパイクなし継続。パラメータ自動緩和中:\n"
+                f"BTC vol {orig_btc_vol:.1f}→{btc_vol:.1f}x, "
+                f"ETH reversal {orig_eth_reversal:.1f}→{eth_reversal:.1f}x, "
+                f"SOL vol {orig_sol_vol:.1f}→{sol_vol:.1f}x"
+            )
+        except Exception as e:
+            logger.warning("FallbackAdjust: telegram notification failed: %s", e)
+
+    # journal記録
+    _write_fallback_adjust_journal(phase, elapsed_min, consecutive_cycles, {
+        "btc_vol_threshold": (orig_btc_vol, btc_vol),
+        "eth_reversal_threshold": (orig_eth_reversal, eth_reversal),
+        "eth_momentum_low_vol_skip": (orig_eth_skip, eth_low_vol_skip),
+        "sol_vol_threshold": (orig_sol_vol, sol_vol),
+    })
+
+    return adjusted
+
+
+def _write_fallback_adjust_journal(
+    phase: int,
+    elapsed_min: int,
+    consecutive_cycles: int,
+    changes: dict,
+) -> None:
+    """fallbackパラメータ自動調整をjournalに記録する。"""
+    now = datetime.now(timezone.utc)
+    journal_path = _JOURNAL_DIR / f"{now.strftime('%Y-%m-%d')}.md"
+    _JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
+
+    lines = [
+        f"\n## FallbackAdjust Phase{phase} ({now.strftime('%Y-%m-%d %H:%M UTC')})\n",
+        f"- **継続時間**: {elapsed_min}分 ({consecutive_cycles}サイクル)\n",
+        f"- **フェーズ**: {'30-59分 (軽度緩和)' if phase == 1 else '60分以上 (追加緩和 + Telegram通知)'}\n",
+        "- **調整内容** (一時的、次サイクル後に再評価):\n",
+    ]
+    for key, (before, after) in changes.items():
+        if before != after:
+            lines.append(f"  - `{key}`: {before} → {after}\n")
+    lines.append("- **注意**: リスク制限 (risk_params.yaml) は変更しない\n")
+
+    try:
+        existing = journal_path.read_text(encoding="utf-8") if journal_path.exists() else ""
+        journal_path.write_text(existing + "".join(lines), encoding="utf-8")
+    except Exception as e:
+        logger.error("FallbackAdjust: failed to write journal: %s", e)
 
 
 def _write_fallback_and_exit(symbols: list[str], reason: str) -> None:
