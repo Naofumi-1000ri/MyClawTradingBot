@@ -15,6 +15,7 @@ strategy:
     vol_threshold: 5.0           # 旧7.0→5.0: upper 77%勝率 (30日BTデータ), 機会損失削減
                                  # zones: penetration(-20~0%→LONG), upper_range(40%~→SHORT)
                                  # upper_range TP=0.5%/SL=0.6% (旧TP=0.3%。EV -0.069%→+0.049%)
+    quiet_long_enabled: true     # Pattern D 再有効化 (BT根拠: n=13, avg+0.32%上昇, entry_cooldown=10分で連続抑制)
     h4_window: 48
     vol_window: 288
     timeout_candles: 5
@@ -36,9 +37,9 @@ strategy:
     # Pattern C: quiet_long (静観脱却 - 2026-02-21追加)
     # スパイク不要。低出来高+GOLDEN+4H中位以下 → LONG
     # 30日BT n=22: WR=68.2%, EV=+0.179%, 約1.5件/日 (h4_max_pct緩和後)
-    quiet_long_enabled: true          # Pattern C 有効 (false で無効化可能)
+    quiet_long_enabled: true          # Pattern C 再有効化 (実績3件: loss=1件,BE=1件,open=1件。統計不十分で誤無効化)
     quiet_long_h4_max_pct: 45         # 4H pos < 45% (旧50%→45%: 直近BTで40-50%ゾーンはtimeoutが多くEV低下確認)
-    quiet_long_vol_ratio_max: 0.60    # 直近5本/100本平均 < 0.60 (低出来高確認)
+    quiet_long_vol_ratio_max: 0.50    # 直近5本/100本平均 < 0.50 (旧0.60→0.50: 0.59ギリギリケースを除外し品質向上)
     quiet_long_vol_short_window: 5    # 直近N本の出来高平均
     quiet_long_vol_long_window: 100   # 比較対象の長期出来高平均
     quiet_long_tp_pct: 0.004          # TP 0.4% (30日BT最適: TP0.4/SL0.6/10bar)
@@ -51,6 +52,7 @@ strategy:
     symbol: "SOL"
     vol_threshold: 5.5           # 旧6.5→5.5: 6.5xは機会が少なすぎ。5.5xで頻度増加 (静観脱却)
     deep_threshold: 7.0          # deep_below LONG: 7x+ 高閾値 (deep_reversalは一時無効化中)
+    quiet_short_enabled: true    # Pattern E 再有効化 (BT根拠: n=76, WR=40.8%, PF=2.91, funding_rateフィルターあり)
     h4_window: 48
     vol_window: 288
 
