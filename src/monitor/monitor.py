@@ -29,8 +29,9 @@ def _read_safe(path: Path) -> dict:
 def _check_rubber_fallback_duration(state_dir: Path) -> str | None:
     """Rubber fallback が RUBBER_FALLBACK_ALERT_MINUTES 以上継続していればアラートメッセージを返す。
 
-    ooda_log.json の直近エントリーを走査し、最初に fallback でないエントリーが現れるまで
-    連続 fallback 期間を測定する。アラート重複送信は fallback_alert_state.json で制御。
+    ooda_log.json の直近エントリーを走査し、スパイクなし系のfallbackが連続している区間を測定する。
+    「新規エントリー停止中」は意図的な停止状態のためカウント対象外。
+    アラート重複送信は fallback_alert_state.json で制御。
 
     Returns:
         アラートメッセージ (str) または None (閾値未満 or クールダウン中)。
@@ -47,18 +48,29 @@ def _check_rubber_fallback_duration(state_dir: Path) -> str | None:
 
     now = datetime.now(timezone.utc)
 
-    # 最新エントリーから遡り、連続 fallback の開始時刻を探す
+    # 最新エントリーから遡り、スパイク検知系fallbackの連続区間を測定する
+    # 「新規エントリー停止中」は意図的な状態のためアラート対象外
     fallback_start: datetime | None = None
+    spike_fallback_count = 0
+    reason_counts: dict[str, int] = {}
+
     for entry in reversed(entries):
         market_summary = entry.get("market_summary", "")
         ts_str = entry.get("timestamp", "")
-        is_fallback = "Rubber fallback:" in market_summary
 
-        if not is_fallback:
-            # fallback でないエントリーが見つかった → ここで連続区間終了
+        is_fallback = "Rubber fallback:" in market_summary
+        # 「新規エントリー停止中」は意図的停止 → アラートカウント対象外
+        is_intentional_stop = "新規エントリー停止中" in market_summary
+
+        if not is_fallback or is_intentional_stop:
+            # スパイク系fallback以外のエントリーが見つかった → 連続区間終了
             break
 
-        # fallback エントリー → 開始時刻を更新
+        # スパイク系fallbackエントリー → カウントして開始時刻を更新
+        spike_fallback_count += 1
+        reason = market_summary.replace("Rubber fallback:", "").strip()
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+
         try:
             ts = datetime.fromisoformat(ts_str)
             if ts.tzinfo is None:
@@ -67,14 +79,14 @@ def _check_rubber_fallback_duration(state_dir: Path) -> str | None:
         except (ValueError, TypeError):
             continue
 
-    if fallback_start is None:
-        # 全エントリーが fallback でない (= 最新が non-fallback)
+    if fallback_start is None or spike_fallback_count == 0:
+        # スパイク系fallbackなし (= 最新が non-fallback or 停止中のみ)
         return None
 
     fallback_minutes = (now - fallback_start).total_seconds() / 60.0
     logger.info(
-        "Rubber fallback duration: %.1f min (threshold=%d min)",
-        fallback_minutes, RUBBER_FALLBACK_ALERT_MINUTES,
+        "Rubber fallback duration: %.1f min (threshold=%d min, spike_cycles=%d)",
+        fallback_minutes, RUBBER_FALLBACK_ALERT_MINUTES, spike_fallback_count,
     )
 
     if fallback_minutes < RUBBER_FALLBACK_ALERT_MINUTES:
@@ -104,24 +116,53 @@ def _check_rubber_fallback_duration(state_dir: Path) -> str | None:
         except (ValueError, TypeError):
             pass
 
-    # 最新 fallback エントリーの reason を取得
-    latest_entry = entries[-1]
-    latest_summary = latest_entry.get("market_summary", "")
-    reason = latest_summary.replace("Rubber fallback: ", "").strip() or "不明"
+    # 代表理由を取得 (最多出現の reason)
+    top_reason = max(reason_counts, key=lambda k: reason_counts[k]) if reason_counts else "不明"
+
+    # 市場データから診断情報を取得 (直近5mの出来高比率を簡易計算)
+    diagnosis_lines = []
+    try:
+        market_data_path = state_dir.parent / "data" / "market_data.json"
+        market_data = read_json(market_data_path)
+        symbols = market_data.get("symbols", {}) if isinstance(market_data, dict) else {}
+        for sym in ["BTC", "ETH", "SOL"]:
+            sym_data = symbols.get(sym, {})
+            mid_price = sym_data.get("mid_price")
+            candles = sym_data.get("candles_5m", [])
+            if len(candles) >= 20 and mid_price:
+                vols = [float(c.get("v") or 0) for c in candles]
+                recent_vol = vols[-1]
+                avg_vol = sum(vols[-20:-1]) / 19 if len(vols) >= 20 else 1
+                vol_ratio = recent_vol / avg_vol if avg_vol > 0 else 0
+                diagnosis_lines.append(
+                    f"  {sym}: vol_ratio={vol_ratio:.1f}x  price={mid_price:,.0f}"
+                )
+    except Exception:
+        pass  # 市場データ取得失敗は無視
 
     # アラート送信時刻を記録
     alert_state["last_fallback_alert"] = now.isoformat()
+    alert_state["last_fallback_duration_min"] = round(fallback_minutes, 1)
+    alert_state["last_fallback_reason"] = top_reason
     try:
         from src.utils.file_lock import atomic_write_json
         atomic_write_json(alert_state_path, alert_state)
     except Exception as e:
         logger.warning("fallback_alert_state 保存失敗: %s", e)
 
-    msg = (
-        f"Rubber fallback 継続 {fallback_minutes:.0f}分: {reason}。"
-        f"市場状況・戦略パラメータを確認してください。"
-    )
-    logger.warning(msg)
+    fallback_start_str = fallback_start.strftime("%H:%M UTC")
+    msg_lines = [
+        f"Rubber fallback 継続 {fallback_minutes:.0f}分 ({spike_fallback_count}サイクル)",
+        f"原因: {top_reason}",
+        f"開始: {fallback_start_str}",
+    ]
+    if diagnosis_lines:
+        msg_lines.append("vol_ratio状況:")
+        msg_lines.extend(diagnosis_lines)
+    msg_lines.append("→ 市場状況・戦略パラメータを確認してください。")
+
+    msg = "\n".join(msg_lines)
+    logger.warning("Rubber fallback alert: %s", msg.replace("\n", " | "))
     return msg
 
 
@@ -257,6 +298,8 @@ def run_monitor() -> None:
     # 4c. Rubber fallback 継続アラート (30分超えでレビュー促進)
     fallback_alert = _check_rubber_fallback_duration(state_dir)
     if fallback_alert:
+        # fallback アラートは即時 Telegram 送信 (他のアラートとは独立して通知)
+        send_message(f"*Rubber Fallback Alert*\n{fallback_alert}")
         alerts.append(fallback_alert)
 
     # 5. データ品質継続劣化チェック (data_health_summary の consecutive_low_score 監視)
