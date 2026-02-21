@@ -119,7 +119,50 @@ def _check_rubber_fallback_duration(state_dir: Path) -> str | None:
     # 代表理由を取得 (最多出現の reason)
     top_reason = max(reason_counts, key=lambda k: reason_counts[k]) if reason_counts else "不明"
 
-    # 市場データから診断情報を取得 (直近5mの出来高比率を簡易計算)
+    # ooda_log が満杯(30件)かつ全件fallbackの場合、アーカイブで開始時刻を遡って補正
+    # spike_fallback_count == len(entries) は「ログ全件がfallback」 = 実際の開始はさらに古い可能性
+    archive_extended = False
+    if spike_fallback_count == len(entries):
+        try:
+            archive_dir = state_dir / "ooda_archive"
+            # 最新のアーカイブファイルを1件だけ参照
+            archive_files = sorted(archive_dir.glob("*.json"), reverse=True)
+            if archive_files:
+                arc_entries = read_json(archive_files[0])
+                if isinstance(arc_entries, list) and arc_entries:
+                    # アーカイブ末尾(最新エントリ)から遡りfallback連続区間を確認
+                    for arc_entry in reversed(arc_entries):
+                        arc_ms = arc_entry.get("market_summary", "")
+                        if "Rubber fallback:" in arc_ms and "新規エントリー停止中" not in arc_ms:
+                            ts_str = arc_entry.get("timestamp", "")
+                            try:
+                                ts = datetime.fromisoformat(ts_str)
+                                if ts.tzinfo is None:
+                                    ts = ts.replace(tzinfo=timezone.utc)
+                                fallback_start = ts
+                                spike_fallback_count += 1
+                                archive_extended = True
+                            except (ValueError, TypeError):
+                                pass
+                        else:
+                            break
+        except Exception:
+            pass  # アーカイブ参照失敗は無視 (アラート自体は送る)
+
+    if archive_extended:
+        fallback_minutes = (now - fallback_start).total_seconds() / 60.0
+        logger.info(
+            "Fallback start extended via archive: %.1f min total (%d+ cycles)",
+            fallback_minutes, spike_fallback_count,
+        )
+
+    # 市場データから診断情報を取得 (スパイク閾値との比較付き)
+    # BTC/SOL スパイク閾値: vol_threshold=5.0x (長期平均比)
+    # ETH: Pattern A reversal は big spike (別計算), Pattern C quiet は vol_ratio < 0.3x
+    SPIKE_THRESHOLD = {
+        "BTC": 5.0,  # BtcRubberWall default vol_threshold
+        "SOL": 5.0,  # SolRubberWall default vol_threshold (BTC型と同様)
+    }
     diagnosis_lines = []
     try:
         market_data_path = state_dir.parent / "data" / "market_data.json"
@@ -131,14 +174,48 @@ def _check_rubber_fallback_duration(state_dir: Path) -> str | None:
             candles = sym_data.get("candles_5m", [])
             if len(candles) >= 20 and mid_price:
                 vols = [float(c.get("v") or 0) for c in candles]
+                # 直近1本 vs 直近20本平均 (モニター用簡易計算)
                 recent_vol = vols[-1]
                 avg_vol = sum(vols[-20:-1]) / 19 if len(vols) >= 20 else 1
                 vol_ratio = recent_vol / avg_vol if avg_vol > 0 else 0
-                diagnosis_lines.append(
-                    f"  {sym}: vol_ratio={vol_ratio:.1f}x  price={mid_price:,.0f}"
-                )
+                threshold = SPIKE_THRESHOLD.get(sym)
+                if threshold:
+                    gap = vol_ratio / threshold
+                    gap_pct = gap * 100
+                    diagnosis_lines.append(
+                        f"  {sym}: vol_ratio={vol_ratio:.1f}x / 閾値{threshold:.0f}x"
+                        f" ({gap_pct:.0f}%)  price={mid_price:,.0f}"
+                    )
+                else:
+                    # ETH: quiet_long は vol_ratio < 0.3x を狙う戦略
+                    diagnosis_lines.append(
+                        f"  {sym}: vol_ratio={vol_ratio:.1f}x (quiet<0.3x)  price={mid_price:,.0f}"
+                    )
     except Exception:
         pass  # 市場データ取得失敗は無視
+
+    # キャッシュからスパイク閾値ボリュームを取得 (最新計算値)
+    cache_info_lines = []
+    try:
+        btc_cache = read_json(state_dir / "rubber_wall_cache.json")
+        if isinstance(btc_cache, dict) and "threshold_vol" in btc_cache:
+            cache_info_lines.append(f"  BTC spike閾値 (絶対量): {btc_cache['threshold_vol']:.1f}")
+    except Exception:
+        pass
+    try:
+        sol_cache = read_json(state_dir / "sol_rubber_wall_cache.json")
+        if isinstance(sol_cache, dict) and "threshold_vol" in sol_cache:
+            cache_info_lines.append(f"  SOL spike閾値 (絶対量): {sol_cache['threshold_vol']:.1f}")
+    except Exception:
+        pass
+
+    # 継続時間に応じた推奨アクション
+    if fallback_minutes >= 120:
+        action = "120分超: パラメータ緩和 or quiet_long 条件見直しを検討"
+    elif fallback_minutes >= 60:
+        action = "60分超: 市場状況確認 + vol_threshold の妥当性レビュー"
+    else:
+        action = "30分超: 次サイクルで自然解消か継続監視"
 
     # アラート送信時刻を記録
     alert_state["last_fallback_alert"] = now.isoformat()
@@ -152,14 +229,17 @@ def _check_rubber_fallback_duration(state_dir: Path) -> str | None:
 
     fallback_start_str = fallback_start.strftime("%H:%M UTC")
     msg_lines = [
-        f"Rubber fallback 継続 {fallback_minutes:.0f}分 ({spike_fallback_count}サイクル)",
+        f"Rubber fallback 継続 {fallback_minutes:.0f}分 ({spike_fallback_count}+サイクル)" if archive_extended
+        else f"Rubber fallback 継続 {fallback_minutes:.0f}分 ({spike_fallback_count}サイクル)",
         f"原因: {top_reason}",
         f"開始: {fallback_start_str}",
     ]
     if diagnosis_lines:
-        msg_lines.append("vol_ratio状況:")
+        msg_lines.append("vol_ratio状況 (vs spike閾値):")
         msg_lines.extend(diagnosis_lines)
-    msg_lines.append("→ 市場状況・戦略パラメータを確認してください。")
+    if cache_info_lines:
+        msg_lines.extend(cache_info_lines)
+    msg_lines.append(f"推奨: {action}")
 
     msg = "\n".join(msg_lines)
     logger.warning("Rubber fallback alert: %s", msg.replace("\n", " | "))
