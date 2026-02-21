@@ -223,6 +223,18 @@ class EthRubberBand(BaseStrategy):
         h4_pos = self._range_position(candle["c"], h4_low, h4_high)
 
         if h4_pos >= h4_max_pct:
+            # 4H高値圏では逆張りLONG不利 (30日BT: pos>=40%でWR=25%)
+            # フォールオーバー: 強スパイク(reversal_thr以上)が高値圏に来た場合、
+            # Pattern B相当のSHORT momentumが有効か判定する
+            # (通常Pattern Bはratio<reversal_thrのみ対象だが、高値圏での強BEARはSHORT有利)
+            zone_min = self.cfg["momentum_zone_min"]
+            if h4_pos >= zone_min:
+                logger.info(
+                    "Pattern A→B fallover: pos=%.1f%% >= max=%d%%, vol_ratio=%.1f >= reversal_thr "
+                    "→ 高値圏BEARスパイク: reversal不可、Pattern B (SHORT) を試みる",
+                    h4_pos, h4_max_pct, ratio,
+                )
+                return self._pattern_b_momentum(idx, candle, ratio, vol_regime, vol_multiplier)
             logger.info(
                 "Pattern A: SKIP (4H pos=%.1f%% >= max=%d%%, 4H=[%.2f-%.2f], "
                 "4H高値圏 → 逆張りLONG不利。30日BT: pos>=40%%でWR=25%%)",
@@ -436,6 +448,14 @@ class EthRubberBand(BaseStrategy):
         entry = candle["c"]
         pos = self._range_position(entry, h4_low, h4_high)
         if pos >= h4_max_pct:
+            # 直前まで発火していた境界ゾーン (h4_max_pct-5 ~ h4_max_pct) はtimeout多発傾向
+            # 2026-02-21 BT: 43-50%ゾーンはtimeout 5/12件 → h4_max_pct=45%で除外済み
+            if pos < h4_max_pct + 10:
+                logger.info(
+                    "Pattern C: SKIP (4H pos=%.1f%% >= max=%d%%, 境界ゾーン=%.1f%%~%d%%. "
+                    "timeout多発ゾーン: h4_max_pctを引き下げても同様ならさらに絞り込みを検討)",
+                    pos, h4_max_pct, h4_max_pct, h4_max_pct + 10,
+                )
             return None
 
         # 3. 低出来高チェック (直近N本/長期M本 < 閾値)

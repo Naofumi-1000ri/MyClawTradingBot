@@ -198,7 +198,9 @@ class SolRubberWall(BaseStrategy):
         next_cache = self._build_next_cache(idx)
 
         if matched_zone is None:
-            logger.info("Position %.1f%% falls in skip zone (bottom 0-20%%)", pos)
+            # SOLは 0-40% がスキップゾーン (bottom 0-20% + グレーゾーン 20-40%)
+            # upper_range は 40% 以上のみ有効 (2026-02-21: 20%→40%に変更済み)
+            logger.info("Position %.1f%% falls in skip zone (0-40%%: bottom+gray zone)", pos)
             return None, next_cache
 
         direction = matched_cfg["direction"]
