@@ -19,15 +19,18 @@ Pattern B (momentum):  中閾値 BEAR spike + 上位ゾーン → SHORT
 
 Pattern C (quiet_long):  スパイクなし + 低出来高 + GOLDEN + 4H低位 → LONG
   - スパイク不要: Rubber戦略が機能しない「静かな市場」でも発火する代替戦略
-  - 条件: EMA9 > EMA21 (GOLDEN), 4H pos < 50% (中位以下), 直近5本/100本出来高比 < 0.60
+  - 条件: EMA9 > EMA21 (GOLDEN), 4H pos < 45% (中低位), 直近5本/100本出来高比 < 0.60
   - 4H EMA補助 (quiet_long_use_4h_ema=true): 5m DEAD でも 4H EMA9 > EMA21 なら発火許可
   - 30日BT (n=22): WR=68.2% (TP達成), SL hit=13.6%, Timeout=18.2%, EV=+0.179%
   - TP = 0.4%, SL = 0.6%, タイムアウト = 10bar (50分)
-  - 頻度: 約1.5件/日 (h4_max_pct緩和35%→50%により頻度増加)
+  - 頻度: 約1.2件/日 (h4_max_pct=45%設定)
   - 静観・フォールバック状態を打破する主要な代替戦略
   - 2026-02-21 h4_max_pct緩和: 35%→50%
     理由: 35%フィルターはETHが底値圏にいない時に発火機会ゼロになる問題
     BTでは30-50%ゾーンでも十分なWRを確認。pos=46%が典型的な実運用値で機会損失大きい
+  - 2026-02-21 h4_max_pct再調整: 50%→45%
+    理由: 直近28時間BTでpos=43-50%ゾーンはtimeoutが多く(5件中3件)EV低下
+    pos<45%では30日BT WR=68.2%の品質を維持しつつ無駄なtimeout削減
 
 2026-02-21 最適化 (実運用20件分析):
   - ETH LONG: 13件 6勝 PnL=-$0.72。下降トレンド中の逆張りが損失主因
@@ -83,7 +86,7 @@ _DEFAULT_CONFIG = {
     # 30日BT n=22: WR=68.2%, EV=+0.179%, 約1.5件/日 (緩和後)
     # スパイク不要。低出来高の静かな市場でGOLDEN+底値圏のLONG
     "quiet_long_enabled": True,          # Pattern C 有効/無効フラグ
-    "quiet_long_h4_max_pct": 50,         # 4H pos < 50% (中位以下: 旧35%→50%。pos=46%など典型値で機会損失防止)
+    "quiet_long_h4_max_pct": 45,         # 4H pos < 45% (旧50%→45%: 40-50%ゾーンはtimeout多くEV低下)
     "quiet_long_vol_ratio_max": 0.60,    # 直近5本/100本平均 < 0.60 (低出来高確認)
     "quiet_long_vol_short_window": 5,    # 直近N本の出来高平均 (分子)
     "quiet_long_vol_long_window": 100,   # 比較対象の出来高平均 (分母)
@@ -244,6 +247,7 @@ class EthRubberBand(BaseStrategy):
             "pattern": "A_reversal",
             "exit_mode": "time_cut",    # 旧tp_sl→time_cut: exit_bars=12 (60分) タイムアウト追加
             "exit_bars": 12,             # 60分でSL/TP未決着時タイムアウト (BTで平均8本で決着)
+            "range_position": round(h4_pos, 1),  # 4H pos記録 (デバッグ・パフォーマンス追跡用)
             "vol_ratio": round(ratio, 1),
             "spike_time": candle["t"],
         }

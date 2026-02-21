@@ -37,7 +37,7 @@ strategy:
     # スパイク不要。低出来高+GOLDEN+4H中位以下 → LONG
     # 30日BT n=22: WR=68.2%, EV=+0.179%, 約1.5件/日 (h4_max_pct緩和後)
     quiet_long_enabled: true          # Pattern C 有効 (false で無効化可能)
-    quiet_long_h4_max_pct: 50         # 4H pos < 50% (中位以下。旧35%→50%: pos=46%など典型値での機会損失防止)
+    quiet_long_h4_max_pct: 45         # 4H pos < 45% (旧50%→45%: 直近BTで40-50%ゾーンはtimeoutが多くEV低下確認)
     quiet_long_vol_ratio_max: 0.60    # 直近5本/100本平均 < 0.60 (低出来高確認)
     quiet_long_vol_short_window: 5    # 直近N本の出来高平均
     quiet_long_vol_long_window: 100   # 比較対象の長期出来高平均
