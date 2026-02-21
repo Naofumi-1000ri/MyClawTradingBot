@@ -14,7 +14,8 @@ SOL 固有のボラティリティに合わせた広いTP/SL設定。
   - TP=0.6%/SL=0.8%/exit_bars=10 (50分): BT最適パラメータ
   - BEARスパイク不要: 静かな上昇高値圏で価格が重くなるパターンにSHORT
   - funding_rate フィルター: 極端なネガティブfunding時はSHORTブロック (既存ロジック流用)
-  - 頻度: 1日1-2回 (SOLのスパイク待ち静観を打破する補助戦略)
+  - 頻度: 1日2-3回 (SOLのスパイク待ち静観を打破する補助戦略)
+  - 2026-02-21 h4_min_pct 75%→70%: 75%は発火機会が少なすぎた。70%に緩和して高値圏を広く設定
 
 2026-02-21 quiet_short追加:
   - 静観率90%以上の問題に対する補助戦略として実装
@@ -68,7 +69,7 @@ _DEFAULT_CONFIG = {
     # Pattern E: quiet_short (静観脱却)
     # 2026-02-21 BT: 4H pos>75% + GOLDEN + vol5/100<0.50x → n=76 WR=40.8%, PF=2.91
     "quiet_short_enabled": True,
-    "quiet_short_h4_min_pct": 75,        # 4H pos >= 75% (高位ゾーン)
+    "quiet_short_h4_min_pct": 70,        # 4H pos >= 70% (旧75%→70%: 高値圏をより広く設定、発火機会を拡大)
     "quiet_short_vol_ratio_max": 0.50,   # 直近5本/100本 < 0.50 (低出来高)
     "quiet_short_vol_short_window": 5,   # 直近N本平均 (分子)
     "quiet_short_vol_long_window": 100,  # 比較対象M本平均 (分母)

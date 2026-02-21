@@ -15,7 +15,7 @@ strategy:
     vol_threshold: 5.0           # 旧7.0→5.0: upper 77%勝率 (30日BTデータ), 機会損失削減
                                  # zones: penetration(-20~0%→LONG), upper_range(40%~→SHORT)
                                  # upper_range TP=0.5%/SL=0.6% (旧TP=0.3%。EV -0.069%→+0.049%)
-    quiet_long_enabled: true     # Pattern D 再有効化 (BT根拠: n=13, avg+0.32%上昇, entry_cooldown=10分で連続抑制)
+    quiet_long_enabled: true     # Pattern D 有効 (BT根拠: n=13, avg+0.32%上昇)
     h4_window: 48
     vol_window: 288
     timeout_candles: 5
@@ -52,7 +52,7 @@ strategy:
     symbol: "SOL"
     vol_threshold: 5.5           # 旧6.5→5.5: 6.5xは機会が少なすぎ。5.5xで頻度増加 (静観脱却)
     deep_threshold: 7.0          # deep_below LONG: 7x+ 高閾値 (deep_reversalは一時無効化中)
-    quiet_short_enabled: true    # Pattern E 再有効化 (BT根拠: n=76, WR=40.8%, PF=2.91, funding_rateフィルターあり)
+    quiet_short_enabled: true    # Pattern E 有効 (BT根拠: n=76, WR=40.8%, PF=2.91, h4_min_pct=70%に緩和)
     h4_window: 48
     vol_window: 288
 

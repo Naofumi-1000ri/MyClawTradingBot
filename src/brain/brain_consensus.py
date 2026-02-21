@@ -211,7 +211,19 @@ def _check_rubber_exits(symbol: str, context: dict) -> list[dict]:
             atomic_write_json(meta_path, meta)
             logger.info("%s %s: bar %d/%d (time_cut pending, mid=%.4f, SL=%.4f)",
                         symbol, pattern, bar_count, exit_bars, mid_price, sl_price)
-            return []
+            # ポジション保有継続中: fallback出力を防ぐため「hold_position」シグナルを返す
+            return [{
+                "symbol": symbol,
+                "action": "hold_position",
+                "direction": "hold_position",
+                "confidence": 1.0,
+                "reasoning": (
+                    f"{symbol}Rubber holding ({pattern}): bar {bar_count}/{exit_bars}, "
+                    f"mid={mid_price:.4f}, SL={sl_price:.4f}"
+                ),
+                "zone": "holding",
+                "pattern": pattern,
+            }]
 
     if close_reason:
         logger.info("%s EXIT (%s): %s", symbol, pattern, close_reason)
@@ -226,9 +238,22 @@ def _check_rubber_exits(symbol: str, context: dict) -> list[dict]:
             "pattern": pattern,
         }]
 
+    # tp_sl モードでSL/TP未達: ポジション保有継続
     logger.info("%s %s: holding (mid=%.4f, SL=%.4f, exit_mode=%s)",
                 symbol, pattern, mid_price, sl_price, exit_mode)
-    return []
+    # ポジション保有継続中: fallback出力を防ぐため「hold_position」シグナルを返す
+    return [{
+        "symbol": symbol,
+        "action": "hold_position",
+        "direction": "hold_position",
+        "confidence": 1.0,
+        "reasoning": (
+            f"{symbol}Rubber holding ({pattern}): mid={mid_price:.4f}, "
+            f"SL={sl_price:.4f}, TP={tp_price:.4f} ({exit_mode})"
+        ),
+        "zone": "holding",
+        "pattern": pattern,
+    }]
 
 
 # Backward compatibility wrapper
@@ -255,6 +280,14 @@ def _run_rubber_wall(settings: dict, context: dict) -> bool:
     Returns:
         True=スキャン完全失敗 (全銘柄データ不足), False=少なくとも1銘柄スキャン完了。
     """
+    # ──────────────────────────────────────────────────────────
+    # 2026-02-21: ゴム戦略 新規エントリー全停止
+    # - 本番14件全敗 (ISSUE-001)、Wave Rider移行準備のため
+    # - 既存ポジションのexit管理のみ継続 (SL/TP/time_cut)
+    # - 復帰判断は3ヶ月後、5m足長期データ蓄積後
+    # ──────────────────────────────────────────────────────────
+    RUBBER_NEW_ENTRY_ENABLED = False
+
     from src.strategy.btc_rubber_wall import BtcRubberWall
     from src.strategy.eth_rubber_band import EthRubberBand
     from src.strategy.sol_rubber_wall import SolRubberWall
@@ -268,43 +301,45 @@ def _run_rubber_wall(settings: dict, context: dict) -> bool:
     signals_list.extend(btc_exit_signals)
 
     # 2) 新規シグナルスキャン
-    has_btc_pos = _has_rubber_position("BTC")
-
-    rw_config = strategy_cfg.get("rubber_wall", {})
-    btc_5m = context.get("market_data", {}).get("BTC", {}).get("candles_5m", [])
-
     # スキャン失敗カウント (データ不足で戦略を実行できなかった銘柄数)
     scan_failed_count = 0
 
-    if btc_5m:
-        cache_path = STATE_DIR / "rubber_wall_cache.json"
-        cache = _load_json_safe(cache_path)
+    if RUBBER_NEW_ENTRY_ENABLED:
+        has_btc_pos = _has_rubber_position("BTC")
+        rw_config = strategy_cfg.get("rubber_wall", {})
+        btc_5m = context.get("market_data", {}).get("BTC", {}).get("candles_5m", [])
 
-        logger.info("RubberWall BTC: scanning %d 5m candles (cache=%s)",
-                     len(btc_5m), "hit" if cache else "cold")
+        if btc_5m:
+            cache_path = STATE_DIR / "rubber_wall_cache.json"
+            cache = _load_json_safe(cache_path)
 
-        btc_signal, btc_next_cache = BtcRubberWall(btc_5m, rw_config).scan(cache)
+            logger.info("RubberWall BTC: scanning %d 5m candles (cache=%s)",
+                         len(btc_5m), "hit" if cache else "cold")
 
-        if btc_next_cache:
-            atomic_write_json(cache_path, btc_next_cache)
+            btc_signal, btc_next_cache = BtcRubberWall(btc_5m, rw_config).scan(cache)
 
-        if btc_signal:
-            if has_btc_pos:
-                logger.info("RubberWall BTC: signal %s but position already open, skip",
-                            btc_signal.get("zone"))
-            elif btc_exit_signals:
-                logger.info("RubberWall BTC: signal %s but exit in progress, skip",
-                            btc_signal.get("zone"))
+            if btc_next_cache:
+                atomic_write_json(cache_path, btc_next_cache)
+
+            if btc_signal:
+                if has_btc_pos:
+                    logger.info("RubberWall BTC: signal %s but position already open, skip",
+                                btc_signal.get("zone"))
+                elif btc_exit_signals:
+                    logger.info("RubberWall BTC: signal %s but exit in progress, skip",
+                                btc_signal.get("zone"))
+                else:
+                    signals_list.append(btc_signal)
+                    _log_rubber_signal(btc_signal)
+                    logger.info("RubberWall BTC: %s (zone=%s, vr=%.1f)",
+                                btc_signal["direction"], btc_signal.get("zone"), btc_signal.get("vol_ratio"))
             else:
-                signals_list.append(btc_signal)
-                _log_rubber_signal(btc_signal)
-                logger.info("RubberWall BTC: %s (zone=%s, vr=%.1f)",
-                            btc_signal["direction"], btc_signal.get("zone"), btc_signal.get("vol_ratio"))
+                logger.info("RubberWall BTC: no spike → hold")
         else:
-            logger.info("RubberWall BTC: no spike → hold")
+            logger.warning("No BTC 5m candles available")
+            scan_failed_count += 1
     else:
-        logger.warning("No BTC 5m candles available")
-        scan_failed_count += 1
+        logger.info("RubberWall BTC: new entry DISABLED (rubber_stopped 2026-02-21)")
 
     # --- ETH RubberBand ---
     # 1) 既存ポジションの exit 監視 (SL/TP/時間カット)
@@ -312,41 +347,44 @@ def _run_rubber_wall(settings: dict, context: dict) -> bool:
     signals_list.extend(eth_exit_signals)
 
     # 2) 新規シグナルスキャン (ポジションがなければ)
-    has_eth_pos = _has_rubber_position("ETH")
+    if RUBBER_NEW_ENTRY_ENABLED:
+        has_eth_pos = _has_rubber_position("ETH")
 
-    rb_config = strategy_cfg.get("rubber_band", {})
-    eth_5m = context.get("market_data", {}).get("ETH", {}).get("candles_5m", [])
+        rb_config = strategy_cfg.get("rubber_band", {})
+        eth_5m = context.get("market_data", {}).get("ETH", {}).get("candles_5m", [])
 
-    if eth_5m:
-        cache_path = STATE_DIR / "rubber_band_cache.json"
-        cache = _load_json_safe(cache_path)
+        if eth_5m:
+            cache_path = STATE_DIR / "rubber_band_cache.json"
+            cache = _load_json_safe(cache_path)
 
-        logger.info("RubberBand ETH: scanning %d 5m candles (cache=%s)",
-                     len(eth_5m), "hit" if cache else "cold")
+            logger.info("RubberBand ETH: scanning %d 5m candles (cache=%s)",
+                         len(eth_5m), "hit" if cache else "cold")
 
-        eth_signal, eth_next_cache = EthRubberBand(eth_5m, rb_config).scan(cache)
+            eth_signal, eth_next_cache = EthRubberBand(eth_5m, rb_config).scan(cache)
 
-        if eth_next_cache:
-            atomic_write_json(cache_path, eth_next_cache)
+            if eth_next_cache:
+                atomic_write_json(cache_path, eth_next_cache)
 
-        if eth_signal:
-            if has_eth_pos:
-                logger.info("RubberBand ETH: signal %s but position already open, skip",
-                            eth_signal.get("pattern"))
-            elif eth_exit_signals:
-                logger.info("RubberBand ETH: signal %s but exit in progress, skip",
-                            eth_signal.get("pattern"))
+            if eth_signal:
+                if has_eth_pos:
+                    logger.info("RubberBand ETH: signal %s but position already open, skip",
+                                eth_signal.get("pattern"))
+                elif eth_exit_signals:
+                    logger.info("RubberBand ETH: signal %s but exit in progress, skip",
+                                eth_signal.get("pattern"))
+                else:
+                    signals_list.append(eth_signal)
+                    _log_rubber_signal(eth_signal)
+                    logger.info("RubberBand ETH: %s %s (pattern=%s, vr=%.1f)",
+                                eth_signal["direction"], eth_signal["symbol"],
+                                eth_signal.get("pattern"), eth_signal.get("vol_ratio"))
             else:
-                signals_list.append(eth_signal)
-                _log_rubber_signal(eth_signal)
-                logger.info("RubberBand ETH: %s %s (pattern=%s, vr=%.1f)",
-                            eth_signal["direction"], eth_signal["symbol"],
-                            eth_signal.get("pattern"), eth_signal.get("vol_ratio"))
+                logger.info("RubberBand ETH: no spike → hold")
         else:
-            logger.info("RubberBand ETH: no spike → hold")
+            logger.warning("No ETH 5m candles available")
+            scan_failed_count += 1
     else:
-        logger.warning("No ETH 5m candles available")
-        scan_failed_count += 1
+        logger.info("RubberBand ETH: new entry DISABLED (rubber_stopped 2026-02-21)")
 
     # --- SOL RubberWall ---
     # 1) 既存ポジションの exit 監視
@@ -354,50 +392,58 @@ def _run_rubber_wall(settings: dict, context: dict) -> bool:
     signals_list.extend(sol_exit_signals)
 
     # 2) 新規シグナルスキャン
-    has_sol_pos = _has_rubber_position("SOL")
+    if RUBBER_NEW_ENTRY_ENABLED:
+        has_sol_pos = _has_rubber_position("SOL")
 
-    sol_rw_config = strategy_cfg.get("sol_rubber_wall", {})
-    sol_5m = context.get("market_data", {}).get("SOL", {}).get("candles_5m", [])
-    sol_funding_rate = context.get("market_data", {}).get("SOL", {}).get("funding_rate", 0.0)
+        sol_rw_config = strategy_cfg.get("sol_rubber_wall", {})
+        sol_5m = context.get("market_data", {}).get("SOL", {}).get("candles_5m", [])
+        sol_funding_rate = context.get("market_data", {}).get("SOL", {}).get("funding_rate", 0.0)
 
-    if sol_5m:
-        cache_path = STATE_DIR / "sol_rubber_wall_cache.json"
-        cache = _load_json_safe(cache_path)
+        if sol_5m:
+            cache_path = STATE_DIR / "sol_rubber_wall_cache.json"
+            cache = _load_json_safe(cache_path)
 
-        # funding_rate をconfigに注入してSolRubberWall側でフィルタリング可能にする
-        sol_rw_config_with_funding = dict(sol_rw_config)
-        sol_rw_config_with_funding["current_funding_rate"] = sol_funding_rate
+            # funding_rate をconfigに注入してSolRubberWall側でフィルタリング可能にする
+            sol_rw_config_with_funding = dict(sol_rw_config)
+            sol_rw_config_with_funding["current_funding_rate"] = sol_funding_rate
 
-        logger.info("RubberWall SOL: scanning %d 5m candles (cache=%s, funding=%.2e)",
-                     len(sol_5m), "hit" if cache else "cold", sol_funding_rate)
+            logger.info("RubberWall SOL: scanning %d 5m candles (cache=%s, funding=%.2e)",
+                         len(sol_5m), "hit" if cache else "cold", sol_funding_rate)
 
-        sol_signal, sol_next_cache = SolRubberWall(sol_5m, sol_rw_config_with_funding).scan(cache)
+            sol_signal, sol_next_cache = SolRubberWall(sol_5m, sol_rw_config_with_funding).scan(cache)
 
-        if sol_next_cache:
-            atomic_write_json(cache_path, sol_next_cache)
+            if sol_next_cache:
+                atomic_write_json(cache_path, sol_next_cache)
 
-        if sol_signal:
-            if has_sol_pos:
-                logger.info("RubberWall SOL: signal %s but position already open, skip",
-                            sol_signal.get("zone"))
-            elif sol_exit_signals:
-                logger.info("RubberWall SOL: signal %s but exit in progress, skip",
-                            sol_signal.get("zone"))
+            if sol_signal:
+                if has_sol_pos:
+                    logger.info("RubberWall SOL: signal %s but position already open, skip",
+                                sol_signal.get("zone"))
+                elif sol_exit_signals:
+                    logger.info("RubberWall SOL: signal %s but exit in progress, skip",
+                                sol_signal.get("zone"))
+                else:
+                    signals_list.append(sol_signal)
+                    _log_rubber_signal(sol_signal)
+                    logger.info("RubberWall SOL: %s (zone=%s, vr=%.1f)",
+                                sol_signal["direction"], sol_signal.get("zone"),
+                                sol_signal.get("vol_ratio"))
             else:
-                signals_list.append(sol_signal)
-                _log_rubber_signal(sol_signal)
-                logger.info("RubberWall SOL: %s (zone=%s, vr=%.1f)",
-                            sol_signal["direction"], sol_signal.get("zone"),
-                            sol_signal.get("vol_ratio"))
+                logger.info("RubberWall SOL: no spike → hold")
         else:
-            logger.info("RubberWall SOL: no spike → hold")
+            logger.warning("No SOL 5m candles available")
+            scan_failed_count += 1
     else:
-        logger.warning("No SOL 5m candles available")
-        scan_failed_count += 1
+        logger.info("RubberWall SOL: new entry DISABLED (rubber_stopped 2026-02-21)")
 
     # --- 統合出力 ---
     if signals_list:
         merged = _signals_to_merged(signals_list)
+    elif not RUBBER_NEW_ENTRY_ENABLED:
+        # 新規エントリー全停止中 (RUBBER_NEW_ENTRY_ENABLED=False):
+        # exitもhold_positionもない → 監視待機状態
+        all_symbols = ["BTC", "ETH", "SOL"]
+        merged = _fallback_output(all_symbols, "新規エントリー停止中: 既存ポジションなし")
     else:
         all_symbols = ["BTC", "ETH", "SOL"]
         merged = _fallback_output(all_symbols, "スパイクなし: 静観")
@@ -417,7 +463,13 @@ def _run_rubber_wall(settings: dict, context: dict) -> bool:
 
 
 def _signals_to_merged(signals: list[dict]) -> dict:
-    """複数シグナルを signals.json 形式に変換。"""
+    """複数シグナルを signals.json 形式に変換。
+
+    hold_position シグナルのみの場合 (ポジション保有継続中):
+      action_type=hold として出力。executor は hold_position を誤解釈しない。
+    trade/close シグナルが含まれる場合:
+      action_type=trade として通常処理。
+    """
     summaries = []
     sig_list = []
     for sig in signals:
@@ -441,17 +493,24 @@ def _signals_to_merged(signals: list[dict]) -> dict:
         sig_list.append(sig_entry)
 
     reasons = [s.get("reasoning", "") for s in signals]
+
+    # hold_position のみ (= ポジション保有継続、新規エントリーもexitもなし) かを判定
+    actionable_directions = {s.get("direction") for s in signals}
+    has_trade_or_exit = bool(actionable_directions - {"hold_position"})
+    action_type = "trade" if has_trade_or_exit else "hold"
+    observe_prefix = "Rubber: " if has_trade_or_exit else "Rubber holding: "
+
     return {
         "ooda": {
-            "observe": "Rubber: " + "; ".join(reasons),
+            "observe": observe_prefix + "; ".join(reasons),
             "orient": ", ".join(summaries),
             "decide": ", ".join(summaries),
         },
-        "action_type": "trade",
+        "action_type": action_type,
         "signals": sig_list,
-        "market_summary": "Rubber: " + ", ".join(summaries),
+        "market_summary": observe_prefix + ", ".join(summaries),
         "journal_entry": "\n".join(reasons),
-        "self_assessment": "Rubber forward test",
+        "self_assessment": "Rubber forward test" if has_trade_or_exit else "Rubber position monitoring",
     }
 
 
