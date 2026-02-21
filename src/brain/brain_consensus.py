@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from src.brain.build_context import build_context
+from src.strategy.wave_rider import WaveRider
 from src.utils.config_loader import get_project_root, load_settings
 from src.utils.file_lock import atomic_write_json, read_json
 from src.utils.logger import setup_logger
@@ -169,6 +170,25 @@ def _check_rubber_exits(symbol: str, context: dict) -> list[dict]:
     meta_path = STATE_DIR / f"{symbol.lower()}_rubber_meta.json"
     meta = _load_json_safe(meta_path)
     if not isinstance(meta, dict) or not meta.get("direction"):
+        # メタがない場合でも実際にポジションがあれば警告 (meta 保存失敗の検知)
+        if _has_live_position(symbol):
+            logger.warning(
+                "%s: live position exists but rubber meta missing! "
+                "Entry may have occurred without meta save. Emitting hold_position to prevent fallback.",
+                symbol,
+            )
+            return [{
+                "symbol": symbol,
+                "action": "hold_position",
+                "direction": "hold_position",
+                "confidence": 1.0,
+                "reasoning": (
+                    f"{symbol}Rubber holding (meta-less): live position detected, "
+                    f"meta file missing. Manual close may be required."
+                ),
+                "zone": "holding",
+                "pattern": "unknown",
+            }]
         return []
 
     sym_data = context.get("market_data", {}).get(symbol, {})
@@ -261,14 +281,397 @@ def _check_eth_rubber_exits(context: dict) -> list[dict]:
     return _check_rubber_exits("ETH", context)
 
 
+def _has_live_position(symbol: str) -> bool:
+    """state/positions.json に実際のポジションが存在するか確認。
+
+    meta ファイルと positions.json の両方をチェックすることで、
+    meta 保存失敗時でも誤エントリーを防ぐ二重ガードとして機能する。
+    """
+    positions = _load_json_safe(STATE_DIR / "positions.json")
+    if not isinstance(positions, list):
+        return False
+    return any(
+        isinstance(p, dict) and p.get("symbol") == symbol and float(p.get("size", 0)) != 0
+        for p in positions
+    )
+
+
 def _has_rubber_position(symbol: str) -> bool:
-    """Rubber meta が存在するか (ポジション有無の判定)。"""
+    """Rubber meta またはライブポジションが存在するか (ポジション有無の判定)。
+
+    meta ファイルが存在する場合は meta を優先。
+    meta がなくても positions.json にポジションがあれば True を返し、
+    誤重複エントリーを防ぐ (meta 保存失敗のフォールバック)。
+    """
     meta = _load_json_safe(STATE_DIR / f"{symbol.lower()}_rubber_meta.json")
-    return isinstance(meta, dict) and bool(meta.get("direction"))
+    if isinstance(meta, dict) and bool(meta.get("direction")):
+        return True
+    # meta がない場合でも実際のポジションがあれば True
+    return _has_live_position(symbol)
 
 
 def _has_eth_rubber_position() -> bool:
     return _has_rubber_position("ETH")
+
+
+def _run_wave_rider_btc(settings: dict, context: dict) -> list[dict]:
+    """Wave Rider BTC: US Open 1h bar momentum + post-session reversion.
+
+    Lifecycle:
+      UTC 15:00: Observe bar (14:00-15:00) → decide entry → write meta
+      UTC 15:05-19:55: SL monitoring
+      UTC 20:00: Time stop → close, optionally trigger reversion pending
+      UTC 20:15: Reversion SHORT entry (if pending)
+      Overnight: SL/TP monitoring for reversion
+      UTC 08:00: Reversion time stop
+
+    State files:
+      state/btc_wave_rider_meta.json — active position tracking
+      state/btc_wr_rev_pending.json — reversion entry pending (15min delay)
+
+    Returns:
+        List of signals (0-2 items: hold_position, entry, close).
+    """
+    wr_config = settings.get("strategy", {}).get("wave_rider", {})
+    if not wr_config.get("enabled", False):
+        return []
+
+    now = datetime.now(timezone.utc)
+    hour = now.hour
+    weekday = now.weekday()  # 0=Mon, 6=Sun
+
+    wr = WaveRider(wr_config)
+    signals = []
+
+    sym_data = context.get("market_data", {}).get("BTC", {})
+    mid_price = float(sym_data.get("mid_price", 0) or 0)
+    if mid_price <= 0:
+        logger.warning("WaveRider BTC: no mid price, skipping")
+        return []
+
+    meta_path = STATE_DIR / "btc_wave_rider_meta.json"
+    pending_path = STATE_DIR / "btc_wr_rev_pending.json"
+    meta = _load_json_safe(meta_path)
+    if not isinstance(meta, dict) or not meta.get("phase"):
+        meta = None
+
+    # ── 1. Exit monitoring (existing position) ──
+    if meta:
+        phase = meta["phase"]
+        direction = meta.get("direction", "long")
+        sl_price = float(meta.get("stop_loss", 0))
+        pattern = meta.get("pattern", "?")
+
+        if phase == "wave_rider":
+            # SL check
+            sl_hit = False
+            if direction == "long" and mid_price <= sl_price:
+                sl_hit = True
+            elif direction == "short" and mid_price >= sl_price:
+                sl_hit = True
+
+            if sl_hit:
+                logger.info("WaveRider BTC: SL hit (%s) mid=%.2f SL=%.2f", pattern, mid_price, sl_price)
+                signals.append({
+                    "symbol": "BTC",
+                    "action": "close",
+                    "direction": "close",
+                    "confidence": 1.0,
+                    "reasoning": f"WaveRider SL hit ({pattern}): mid={mid_price:.2f} vs SL={sl_price:.2f}",
+                    "zone": "exit",
+                    "pattern": pattern,
+                })
+                # Clear meta
+                try:
+                    meta_path.unlink()
+                except FileNotFoundError:
+                    pass
+                return signals
+
+            # Time stop: hour >= 20
+            if hour >= 20:
+                logger.info("WaveRider BTC: time stop (%s) at hour=%d, mid=%.2f", pattern, hour, mid_price)
+                signals.append({
+                    "symbol": "BTC",
+                    "action": "close",
+                    "direction": "close",
+                    "confidence": 1.0,
+                    "reasoning": f"WaveRider time stop ({pattern}): hour={hour}, mid={mid_price:.2f}",
+                    "zone": "exit",
+                    "pattern": pattern,
+                })
+
+                # Check reversion trigger (up_large only)
+                if (
+                    pattern == "wr_up_large"
+                    and wr_config.get("reversion_enabled", False)
+                ):
+                    observe_open = float(meta.get("observe_bar_open", 0))
+                    if observe_open > 0 and wr.should_trigger_reversion(observe_open, mid_price):
+                        deviation = (mid_price - observe_open) / observe_open
+                        entry_after = now.replace(minute=0, second=0, microsecond=0)
+                        # 15min delay from now to avoid entry cooldown
+                        from datetime import timedelta
+                        entry_after = now + timedelta(minutes=15)
+                        pending_data = {
+                            "pattern": "wr_up_large_rev",
+                            "us_close_price": mid_price,
+                            "deviation": round(deviation, 6),
+                            "entry_after": entry_after.isoformat(),
+                        }
+                        STATE_DIR.mkdir(parents=True, exist_ok=True)
+                        atomic_write_json(pending_path, pending_data)
+                        logger.info(
+                            "WaveRider BTC: reversion pending written (dev=%.4f, entry_after=%s)",
+                            deviation, entry_after.isoformat(),
+                        )
+
+                # Clear WR meta
+                try:
+                    meta_path.unlink()
+                except FileNotFoundError:
+                    pass
+                return signals
+
+            # Holding — not SL, not time stop
+            logger.info("WaveRider BTC: holding %s (%s) mid=%.2f SL=%.2f", direction, pattern, mid_price, sl_price)
+            return [{
+                "symbol": "BTC",
+                "action": "hold_position",
+                "direction": "hold_position",
+                "confidence": 1.0,
+                "reasoning": f"WaveRider holding ({pattern}): mid={mid_price:.2f}, SL={sl_price:.2f}",
+                "zone": "holding",
+                "pattern": pattern,
+            }]
+
+        elif phase == "reversion":
+            tp_price = float(meta.get("take_profit", 0))
+
+            # SL check (reversion is always SHORT)
+            if mid_price >= sl_price:
+                logger.info("WaveRider REV: SL hit mid=%.2f >= SL=%.2f", mid_price, sl_price)
+                signals.append({
+                    "symbol": "BTC",
+                    "action": "close",
+                    "direction": "close",
+                    "confidence": 1.0,
+                    "reasoning": f"WaveRider REV SL hit ({pattern}): mid={mid_price:.2f} vs SL={sl_price:.2f}",
+                    "zone": "exit",
+                    "pattern": pattern,
+                })
+                try:
+                    meta_path.unlink()
+                except FileNotFoundError:
+                    pass
+                return signals
+
+            # TP check (SHORT: price <= tp)
+            if tp_price > 0 and mid_price <= tp_price:
+                logger.info("WaveRider REV: TP hit mid=%.2f <= TP=%.2f", mid_price, tp_price)
+                signals.append({
+                    "symbol": "BTC",
+                    "action": "close",
+                    "direction": "close",
+                    "confidence": 1.0,
+                    "reasoning": f"WaveRider REV TP hit ({pattern}): mid={mid_price:.2f} vs TP={tp_price:.2f}",
+                    "zone": "exit",
+                    "pattern": pattern,
+                })
+                try:
+                    meta_path.unlink()
+                except FileNotFoundError:
+                    pass
+                return signals
+
+            # Reversion time stop: UTC 08:00-14:00
+            if 8 <= hour < 14:
+                logger.info("WaveRider REV: time stop at hour=%d, mid=%.2f", hour, mid_price)
+                signals.append({
+                    "symbol": "BTC",
+                    "action": "close",
+                    "direction": "close",
+                    "confidence": 1.0,
+                    "reasoning": f"WaveRider REV time stop ({pattern}): hour={hour}, mid={mid_price:.2f}",
+                    "zone": "exit",
+                    "pattern": pattern,
+                })
+                try:
+                    meta_path.unlink()
+                except FileNotFoundError:
+                    pass
+                return signals
+
+            # Holding reversion
+            logger.info("WaveRider REV: holding SHORT (%s) mid=%.2f SL=%.2f TP=%.2f", pattern, mid_price, sl_price, tp_price)
+            return [{
+                "symbol": "BTC",
+                "action": "hold_position",
+                "direction": "hold_position",
+                "confidence": 1.0,
+                "reasoning": f"WaveRider REV holding ({pattern}): mid={mid_price:.2f}, SL={sl_price:.2f}, TP={tp_price:.2f}",
+                "zone": "holding",
+                "pattern": pattern,
+            }]
+
+    # ── 2. Reversion pending check ──
+    pending = _load_json_safe(pending_path)
+    if isinstance(pending, dict) and pending.get("entry_after"):
+        entry_after = datetime.fromisoformat(pending["entry_after"])
+        if now >= entry_after:
+            # Emit reversion SHORT entry
+            rev_sl = wr.compute_rev_sl(mid_price)
+            rev_tp = wr.compute_rev_tp(mid_price)
+            pattern = pending.get("pattern", "wr_up_large_rev")
+            deviation = pending.get("deviation", 0)
+
+            logger.info(
+                "WaveRider REV: entering SHORT at %.2f (dev=%.4f, TP=%.2f, SL=%.2f)",
+                mid_price, deviation, rev_tp, rev_sl,
+            )
+
+            signals.append({
+                "symbol": "BTC",
+                "action": "short",
+                "direction": "short",
+                "confidence": 0.80,
+                "entry_price": mid_price,
+                "stop_loss": rev_sl,
+                "leverage": 3,
+                "reasoning": f"WaveRider REV entry ({pattern}): dev={deviation:.4f}, TP={rev_tp:.2f}, SL={rev_sl:.2f}",
+                "zone": "wave_rider_rev",
+                "pattern": pattern,
+            })
+
+            # Write reversion meta
+            rev_meta = {
+                "phase": "reversion",
+                "pattern": pattern,
+                "direction": "short",
+                "entry_price": mid_price,
+                "stop_loss": rev_sl,
+                "take_profit": rev_tp,
+                "deviation": deviation,
+                "entry_time": now.isoformat(),
+            }
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(meta_path, rev_meta)
+
+            # Delete pending file
+            try:
+                pending_path.unlink()
+            except FileNotFoundError:
+                pass
+            return signals
+        else:
+            logger.info(
+                "WaveRider REV: pending, waiting until %s (now=%s)",
+                pending["entry_after"], now.isoformat(),
+            )
+            # pending中もhold_positionを返しfallbackを防ぐ
+            pattern = pending.get("pattern", "wr_up_large_rev")
+            return [{
+                "symbol": "BTC",
+                "action": "hold_position",
+                "direction": "hold_position",
+                "confidence": 1.0,
+                "reasoning": (
+                    f"WaveRider REV pending ({pattern}): "
+                    f"waiting until {pending['entry_after']}"
+                ),
+                "zone": "holding",
+                "pattern": pattern,
+            }]
+
+    # ── 3. New WR entry (no meta, no pending, weekday, hour == 15) ──
+    if weekday >= 5:
+        logger.info("WaveRider BTC: weekend (weekday=%d), skip", weekday)
+        return []
+
+    if hour != 15:
+        return []
+
+    # Find the UTC 14:00-15:00 1h candle
+    candles_1h = sym_data.get("candles_1h", [])
+    if not candles_1h:
+        logger.warning("WaveRider BTC: no 1h candles available")
+        return []
+
+    observe_bar = None
+    for c in candles_1h:
+        bar_time = c.get("t") or c.get("time") or c.get("timestamp")
+        if bar_time is None:
+            continue
+        # Handle both ISO string and epoch ms
+        if isinstance(bar_time, str):
+            try:
+                bt = datetime.fromisoformat(bar_time.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+        else:
+            bt = datetime.fromtimestamp(int(bar_time) / 1000, tz=timezone.utc)
+        if bt.hour == 14 and bt.date() == now.date():
+            observe_bar = c
+            break
+
+    if observe_bar is None:
+        logger.info("WaveRider BTC: UTC 14:00 bar not found in 1h candles")
+        return []
+
+    bar_open = float(observe_bar.get("o") or observe_bar.get("open", 0))
+    bar_close = float(observe_bar.get("c") or observe_bar.get("close", 0))
+    if bar_open <= 0 or bar_close <= 0:
+        logger.warning("WaveRider BTC: invalid bar OHLC (open=%.2f, close=%.2f)", bar_open, bar_close)
+        return []
+
+    open_move = (bar_close - bar_open) / bar_open
+    result = wr.decide_entry(open_move)
+
+    if result is None:
+        logger.info("WaveRider BTC: open_move=%.4f (%.2f%%), no entry", open_move, open_move * 100)
+        return []
+
+    direction, pattern, confidence = result
+    entry_price = mid_price
+    sl_price = wr.compute_sl(entry_price, direction)
+
+    logger.info(
+        "WaveRider BTC: ENTRY %s (%s) open_move=%.4f (%.2f%%), entry=%.2f, SL=%.2f",
+        direction, pattern, open_move, open_move * 100, entry_price, sl_price,
+    )
+
+    signals.append({
+        "symbol": "BTC",
+        "action": direction,
+        "direction": direction,
+        "confidence": confidence,
+        "entry_price": entry_price,
+        "stop_loss": sl_price,
+        "leverage": 3,
+        "reasoning": (
+            f"WaveRider entry ({pattern}): open_move={open_move:.4f} ({open_move * 100:.2f}%), "
+            f"entry={entry_price:.2f}, SL={sl_price:.2f}"
+        ),
+        "zone": "wave_rider",
+        "pattern": pattern,
+    })
+
+    # Write WR meta
+    wr_meta = {
+        "phase": "wave_rider",
+        "pattern": pattern,
+        "direction": direction,
+        "entry_price": entry_price,
+        "stop_loss": sl_price,
+        "observe_bar_open": bar_open,
+        "observe_bar_close": bar_close,
+        "entry_time": now.isoformat(),
+    }
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(meta_path, wr_meta)
+    _log_rubber_signal(signals[-1])
+
+    return signals
 
 
 def _run_rubber_wall(settings: dict, context: dict) -> bool:
@@ -340,6 +743,14 @@ def _run_rubber_wall(settings: dict, context: dict) -> bool:
             scan_failed_count += 1
     else:
         logger.info("RubberWall BTC: new entry DISABLED (rubber_stopped 2026-02-21)")
+
+    # --- BTC Wave Rider ---
+    # ゴム停止後の代替戦略: US Open 1h bar momentum + post-session reversion
+    # 独自meta (btc_wave_rider_meta.json) を使用 → executor/state_manager と干渉なし
+    wr_signals = _run_wave_rider_btc(settings, context)
+    signals_list.extend(wr_signals)
+    if wr_signals:
+        logger.info("WaveRider BTC: %d signal(s) emitted", len(wr_signals))
 
     # --- ETH RubberBand ---
     # 1) 既存ポジションの exit 監視 (SL/TP/時間カット)
