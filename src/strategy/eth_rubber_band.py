@@ -128,12 +128,24 @@ class EthRubberBand(BaseStrategy):
             return None, {}
 
         h4_window = self.cfg["h4_window"]
-        reversal_thr = self.cfg["reversal_threshold"]
-        momentum_thr = self.cfg["momentum_threshold"]
+        base_reversal_thr = self.cfg["reversal_threshold"]
+        base_momentum_thr = self.cfg["momentum_threshold"]
 
         idx = len(self.candles) - 2
         if idx < h4_window:
             return None, {}
+
+        # ATRボラティリティ感度調整: 高ボラ時は閾値引き上げ、低ボラ時は引き下げ
+        vol_multiplier, vol_regime = self._atr_volatility_multiplier(idx)
+        reversal_thr = base_reversal_thr * vol_multiplier
+        momentum_thr = base_momentum_thr * vol_multiplier
+        if vol_regime != "normal":
+            logger.info(
+                "VAS: regime=%s, multiplier=%.2f → reversal %.1f→%.1f, momentum %.1f→%.1f",
+                vol_regime, vol_multiplier,
+                base_reversal_thr, reversal_thr,
+                base_momentum_thr, momentum_thr,
+            )
 
         candle = self.candles[idx]
         is_bear = candle["c"] < candle["o"]
@@ -159,6 +171,16 @@ class EthRubberBand(BaseStrategy):
                         return sig_c, next_cache
                 return None, next_cache
             ratio = self._vol_ratio_single(idx)
+            # VAS調整後の閾値で再チェック
+            if ratio < momentum_thr:
+                logger.info("Cache SPIKE but VAS-adjusted momentum_thr=%.1f (regime=%s) filters out ratio=%.1f",
+                            momentum_thr, vol_regime, ratio)
+                next_cache = self._build_next_cache(idx)
+                if self.cfg.get("quiet_long_enabled", True):
+                    sig_c = self._pattern_c_quiet_long(idx, candle)
+                    if sig_c:
+                        return sig_c, next_cache
+                return None, next_cache
         else:
             ratio = self._vol_ratio_single(idx)
             if ratio < momentum_thr:
@@ -174,12 +196,13 @@ class EthRubberBand(BaseStrategy):
         # reversal_threshold 以上 → Pattern A (reversal LONG)
         # momentum_threshold 以上 & reversal_threshold 未満 → Pattern B (momentum SHORT)
         if ratio >= reversal_thr:
-            return self._pattern_a_reversal(idx, candle, ratio)
+            return self._pattern_a_reversal(idx, candle, ratio, vol_regime, vol_multiplier)
         else:
-            return self._pattern_b_momentum(idx, candle, ratio)
+            return self._pattern_b_momentum(idx, candle, ratio, vol_regime, vol_multiplier)
 
     def _pattern_a_reversal(
-        self, idx: int, candle: dict, ratio: float
+        self, idx: int, candle: dict, ratio: float,
+        vol_regime: str = "normal", vol_multiplier: float = 1.0,
     ) -> tuple[dict | None, dict]:
         """Pattern A: 高閾値 BEAR spike → LONG reversal。
 
@@ -229,6 +252,7 @@ class EthRubberBand(BaseStrategy):
             sl_price, sl_from_candle, sl_from_min, sl_dist * 100, h4_pos,
         )
 
+        vas_note = f" [VAS:{vol_regime}x{vol_multiplier:.2f}]" if vol_regime != "normal" else ""
         signal = {
             "symbol": "ETH",
             "action": "long",
@@ -239,7 +263,7 @@ class EthRubberBand(BaseStrategy):
             "stop_loss": sl_price,
             "leverage": 3,
             "reasoning": (
-                f"EthRubberBand A: reversal, vol_ratio={ratio:.1f}x, "
+                f"EthRubberBand A: reversal, vol_ratio={ratio:.1f}x{vas_note}, "
                 f"4H_pos={h4_pos:.1f}%, "
                 f"BEAR spike → LONG TP {tp_pct*100:.1f}% SL={sl_dist*100:.2f}%"
             ),
@@ -249,6 +273,7 @@ class EthRubberBand(BaseStrategy):
             "exit_bars": 12,             # 60分でSL/TP未決着時タイムアウト (BTで平均8本で決着)
             "range_position": round(h4_pos, 1),  # 4H pos記録 (デバッグ・パフォーマンス追跡用)
             "vol_ratio": round(ratio, 1),
+            "vol_regime": vol_regime,
             "spike_time": candle["t"],
         }
         logger.info(
@@ -258,7 +283,8 @@ class EthRubberBand(BaseStrategy):
         return signal, self._build_next_cache(idx)
 
     def _pattern_b_momentum(
-        self, idx: int, candle: dict, ratio: float
+        self, idx: int, candle: dict, ratio: float,
+        vol_regime: str = "normal", vol_multiplier: float = 1.0,
     ) -> tuple[dict | None, dict]:
         """Pattern B: 中閾値 BEAR spike + 上位ゾーン → SHORT momentum。
 
@@ -301,6 +327,7 @@ class EthRubberBand(BaseStrategy):
         # trade_executor の R:R チェックを通すため形式的に遠い値を設定
         tp_price = round(entry * (1 - 0.01), 2)
 
+        vas_note = f" [VAS:{vol_regime}x{vol_multiplier:.2f}]" if vol_regime != "normal" else ""
         signal = {
             "symbol": "ETH",
             "action": "short",
@@ -311,7 +338,7 @@ class EthRubberBand(BaseStrategy):
             "stop_loss": sl_price,
             "leverage": 3,
             "reasoning": (
-                f"EthRubberBand B: momentum, vol_ratio={ratio:.1f}x, "
+                f"EthRubberBand B: momentum, vol_ratio={ratio:.1f}x{vas_note}, "
                 f"pos={pos:.1f}%, 4H=[{h4_low:.2f}-{h4_high:.2f}], "
                 f"→ SHORT {cut_bars}bar cut, SL=candle_high+{sl_dist*100:.2f}%"
             ),
@@ -321,6 +348,7 @@ class EthRubberBand(BaseStrategy):
             "exit_bars": cut_bars,
             "range_position": round(pos, 1),
             "vol_ratio": round(ratio, 1),
+            "vol_regime": vol_regime,
             "spike_time": candle["t"],
         }
         logger.info(

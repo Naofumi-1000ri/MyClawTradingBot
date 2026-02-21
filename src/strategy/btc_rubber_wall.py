@@ -140,12 +140,21 @@ class BtcRubberWall(BaseStrategy):
                            len(self.candles), self.cfg["h4_window"] + 10)
             return None, {}
 
-        vol_threshold = self.cfg["vol_threshold"]
+        base_vol_threshold = self.cfg["vol_threshold"]
         h4_window = self.cfg["h4_window"]
 
         idx = len(self.candles) - 2
         if idx < h4_window:
             return None, {}
+
+        # ATRボラティリティ感度調整: 高ボラ時は閾値引き上げ、低ボラ時は引き下げ
+        vol_multiplier, vol_regime = self._atr_volatility_multiplier(idx)
+        vol_threshold = base_vol_threshold * vol_multiplier
+        if vol_regime != "normal":
+            logger.info(
+                "VAS: regime=%s, multiplier=%.2f → vol_threshold %.1f→%.1f",
+                vol_regime, vol_multiplier, base_vol_threshold, vol_threshold,
+            )
 
         candle = self.candles[idx]
         is_bear = candle["c"] < candle["o"]
@@ -165,8 +174,18 @@ class BtcRubberWall(BaseStrategy):
 
             # スパイク検知 — ログ用に実際の ratio を計算
             ratio = self._vol_ratio_single(idx)
-            logger.info("Cache hit SPIKE: vol=%.1f >= threshold=%.1f, ratio=%.1f",
-                        candle["v"], threshold_vol, ratio)
+            # キャッシュはbase閾値ベースなので、VAS調整後の閾値で再チェック
+            if ratio < vol_threshold:
+                logger.info("Cache SPIKE but VAS-adjusted threshold=%.1f (regime=%s) filters out ratio=%.1f",
+                            vol_threshold, vol_regime, ratio)
+                next_cache = self._build_next_cache(idx)
+                if self.cfg.get("quiet_long_enabled", True):
+                    sig_d = self._pattern_d_quiet_long(idx, candle)
+                    if sig_d:
+                        return sig_d, next_cache
+                return None, next_cache
+            logger.info("Cache hit SPIKE: vol=%.1f >= threshold=%.1f, ratio=%.1f (regime=%s)",
+                        candle["v"], threshold_vol, ratio, vol_regime)
         else:
             # --- Slow path: 対象足だけ計算 O(window) ---
             ratio = self._vol_ratio_single(idx)
@@ -180,8 +199,8 @@ class BtcRubberWall(BaseStrategy):
                         return sig_d, next_cache
                 return None, next_cache
 
-            logger.info("BEAR spike detected: vol_ratio=%.1f, change=%.2f%%",
-                        ratio, (candle["c"] - candle["o"]) / candle["o"] * 100)
+            logger.info("BEAR spike detected: vol_ratio=%.1f, change=%.2f%% (regime=%s)",
+                        ratio, (candle["c"] - candle["o"]) / candle["o"] * 100, vol_regime)
 
         # --- スパイク確定: ゾーン分析 (到達は稀) ---
         h4_low, h4_high = self._h4_range(idx - 1, h4_window)
@@ -234,6 +253,7 @@ class BtcRubberWall(BaseStrategy):
         exit_bars = matched_cfg.get("exit_bars")
         exit_mode = "time_cut" if exit_bars is not None else "tp_sl"
 
+        vas_note = f" [VAS:{vol_regime}x{vol_multiplier:.2f}]" if vol_regime != "normal" else ""
         signal = {
             "symbol": "BTC",
             "action": direction,
@@ -245,7 +265,7 @@ class BtcRubberWall(BaseStrategy):
             "leverage": 3,
             "reasoning": (
                 f"RubberWall: {matched_zone} zone (pos={pos:.1f}%), "
-                f"vol_ratio={ratio:.1f}x, "
+                f"vol_ratio={ratio:.1f}x (thr={vol_threshold:.1f}{vas_note}), "
                 f"4H=[{h4_low:.2f}-{h4_high:.2f}], "
                 f"→ {direction} TP {tp_pct*100:.1f}% SL {sl_pct*100:.1f}%"
                 + (f" timeout={exit_bars}bar" if exit_bars else "")
@@ -253,6 +273,7 @@ class BtcRubberWall(BaseStrategy):
             "zone": matched_zone,
             "range_position": round(pos, 1),
             "vol_ratio": round(ratio, 1),
+            "vol_regime": vol_regime,
             "spike_time": candle["t"],
             "exit_mode": exit_mode,
         }
