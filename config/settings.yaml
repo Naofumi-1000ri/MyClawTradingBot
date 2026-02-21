@@ -34,6 +34,8 @@ strategy:
     momentum_cut_bars: 15        # Pattern B: 75分 (15bar) で時間カット
     momentum_sl_pad_pct: 0.0005  # Pattern B: SL = candle high + 0.05% pad
     momentum_sl_min_dist: 0.0035 # Pattern B: SL最小距離0.35% (旧0.30%→0.35%: 2/20+0.56%SLヒット対策)
+    momentum_low_vol_skip: true  # Pattern B: low_vol regime時はSKIP (偽スパイク防止)
+                                 # 2/21実績: low_vol下でB_momentum 4件WR=0% → BT(高ボラ想定)との乖離防止
     # Pattern C: quiet_long (静観脱却 - 2026-02-21追加)
     # スパイク不要。低出来高+GOLDEN+4H中位以下 → LONG
     # 30日BT n=22: WR=68.2%, EV=+0.179%, 約1.5件/日 (h4_max_pct緩和後)

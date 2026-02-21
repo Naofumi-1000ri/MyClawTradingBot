@@ -16,6 +16,10 @@ Pattern B (momentum):  中閾値 BEAR spike + 上位ゾーン → SHORT
   - 30日BT: mid(40-55%) + vol>=3.0x → SHORT_wr=88% (n=8, 最良ゾーン)
   - TP = 時間カット 15bar (75分, 旧10bar=50分: 短期ノイズ吸収のため延長)
   - SL = IN足high + 0.05%pad, 最小距離0.35% (旧0.30%→0.35%: 2/20実例+0.56%ヒット対策)
+  - low_vol regime スキップ (momentum_low_vol_skip=true 時):
+    VAS低ボラ補正により閾値が下がり偽スパイクが通過するリスクを防止
+    2/21実例: vol_regime=low_vol, vol=4.5x → BTとの乖離 (BT WR=88% vs 実績WR=0%)
+    30日BTは高ボラ期データが中心のため、低ボラ環境でのSHORT不向き
 
 Pattern C (quiet_long):  スパイクなし + 低出来高 + GOLDEN + 4H低位 → LONG
   - スパイク不要: Rubber戦略が機能しない「静かな市場」でも発火する代替戦略
@@ -82,6 +86,8 @@ _DEFAULT_CONFIG = {
     "momentum_cut_bars": 15,        # 旧10bar(50分)→15bar(75分): 短期ノイズ吸収のため延長
     "momentum_sl_pad_pct": 0.0005,  # 0.05% pad above candle high
     "momentum_sl_min_dist": 0.0035, # 旧0.30%→0.35%: 2/20実例+0.56%SLヒット対策 (ノイズ耐性向上)
+    "momentum_low_vol_skip": True,  # low_vol regime時はPattern BをSKIP (偽スパイク防止)
+                                    # 2/21実例: low_vol下で4件WR=0%, BT(高ボラ想定)との乖離を防止
     # Pattern C: quiet_long (静観脱却)
     # 30日BT n=22: WR=68.2%, EV=+0.179%, 約1.5件/日 (緩和後)
     # スパイク不要。低出来高の静かな市場でGOLDEN+底値圏のLONG
@@ -321,6 +327,16 @@ class EthRubberBand(BaseStrategy):
 
         if pos < zone_min:
             logger.info("Position %.1f%% < %d%%, skip", pos, zone_min)
+            return None, next_cache
+
+        # low_vol regime スキップ: 低ボラ市場での偽スパイク防止
+        # VAS補正で閾値が緩んだ結果、本来は弱いスパイクが通過するリスクを防ぐ
+        # 2/21実例: vol_regime=low_vol でのB_momentum 4件がWR=0% (BT=88%との大幅乖離)
+        if vol_regime == "low_vol" and self.cfg.get("momentum_low_vol_skip", True):
+            logger.info(
+                "Pattern B: SKIP (vol_regime=low_vol → 低ボラ市場では偽スパイクリスク高。"
+                "momentum_low_vol_skip=True)"
+            )
             return None, next_cache
 
         sl_pad = self.cfg["momentum_sl_pad_pct"]
