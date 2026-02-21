@@ -290,10 +290,18 @@ class BtcRubberWall(BaseStrategy):
         スパイクが出ない静かな市場でトレンド順張りする補助戦略。
         2026-02-21 BT: 4H pos>70% + GOLDEN + vol5/100<0.3x → n=13 avg+0.32%上昇
 
+        追加フィルター (2026-02-21 強化):
+          4. RSI < 65 (過買いでないこと: 高位でもRSI過熱は危険)
+          5. 価格モメンタム > 0 (直近6本が上向き: トレンド継続確認)
+          6. BBスクイーズ OR ボディ品質 >= 0.35 (コンソリ/方向性足を優先)
+
         条件:
           1. EMA9 > EMA21 (GOLDEN: 上昇トレンド確認)
-          2. 4H range pos >= quiet_long_h4_min_pct (高位ゾーン: デフォルト70%)
-          3. 直近N本/長期M本 出来高比 < quiet_long_vol_ratio_max (低出来高: デフォルト0.40)
+          2. 4H range pos >= quiet_long_h4_min_pct (高位ゾーン: デフォルト65%)
+          3. 直近N本/長期M本 出来高比 < quiet_long_vol_ratio_max (低出来高: デフォルト0.55)
+          4. RSI14 < 65 (過買い除外)
+          5. 直近6本の価格モメンタム > -0.1% (下落トレンド中のLONGを除外)
+          6. ボディ品質 >= 0.25 (ドジ足連続を除外)
         """
         h4_window = self.cfg["h4_window"]
         h4_min_pct = self.cfg.get("quiet_long_h4_min_pct", 70)
@@ -344,17 +352,51 @@ class BtcRubberWall(BaseStrategy):
         if vol_ratio >= vol_ratio_max:
             return None
 
+        # 4. RSIフィルター: 過買い(>=65)でのLONG禁止
+        rsi = self._rsi(idx, period=14)
+        if rsi is not None and rsi >= 65.0:
+            logger.info(
+                "Pattern D: SKIP (RSI=%.1f >= 65, 過買い状態でのLONGは危険)",
+                rsi,
+            )
+            return None
+
+        # 5. 価格モメンタム: 直近6本(30分)が下落トレンドでないこと
+        momentum = self._price_momentum(idx, window=6)
+        if momentum < -0.15:
+            logger.info(
+                "Pattern D: SKIP (momentum=%.3f%% < -0.15%%, 下落中のLONGは不利)",
+                momentum,
+            )
+            return None
+
+        # 6. ボディ品質チェック: 直近3本の平均ボディ比率 >= 0.25
+        body_q = self._candle_body_ratio(idx, window=3)
+        bb_squeeze = self._bb_squeeze(idx, window=20)
+        if body_q < 0.25 and not bb_squeeze:
+            logger.info(
+                "Pattern D: SKIP (body_ratio=%.2f < 0.25, BBスクイーズなし: ドジ足ノイズ状態)",
+                body_q,
+            )
+            return None
+
         tp_price = round(entry * (1 + tp_pct), 2)
         sl_price = round(entry * (1 - sl_pct), 2)
 
-        # CAPS: confidence=0.72 (低確信度) → leverage=1x (縮小サイズ)
-        confidence = 0.72
+        # CAPS: BBスクイーズあり + 強いモメンタム → confidence上げて2x
+        # それ以外は conservative 0.72 → 1x
+        has_quality = bb_squeeze or (body_q >= 0.40 and momentum > 0.05)
+        confidence = 0.75 if has_quality else 0.72
         leverage = self.confidence_to_leverage(confidence)
 
+        rsi_str = f"RSI={rsi:.1f}" if rsi is not None else "RSI=n/a"
+        squeeze_str = "BB_squeeze" if bb_squeeze else f"body={body_q:.2f}"
         logger.info(
             "Pattern D (quiet_long): ema9=%.2f>ema21=%.2f, pos=%.1f%% >= %d%%, "
-            "vol_ratio(5/100)=%.2f < %.2f → LONG TP %.1f%% SL %.1f%% [CAPS: conf=%.2f → %dx]",
-            ema9, ema21, pos, h4_min_pct, vol_ratio, vol_ratio_max,
+            "vol_ratio(5/100)=%.2f, %s, mom=%.3f%%, %s "
+            "→ LONG TP %.1f%% SL %.1f%% [CAPS: conf=%.2f → %dx]",
+            ema9, ema21, pos, h4_min_pct, vol_ratio,
+            rsi_str, momentum, squeeze_str,
             tp_pct * 100, sl_pct * 100, confidence, leverage,
         )
 
@@ -371,6 +413,7 @@ class BtcRubberWall(BaseStrategy):
                 f"BtcRubberWall D: quiet_long, "
                 f"ema9={ema9:.2f}>ema21={ema21:.2f}, "
                 f"4H_pos={pos:.1f}%, vol_ratio(5/100)={vol_ratio:.2f}, "
+                f"{rsi_str}, mom={momentum:.3f}%, {squeeze_str}, "
                 f"→ LONG TP {tp_pct*100:.1f}% SL {sl_pct*100:.1f}% {exit_bars}bar cut "
                 f"[CAPS: {leverage}x]"
             ),

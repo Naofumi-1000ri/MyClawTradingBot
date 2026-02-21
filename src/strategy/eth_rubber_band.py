@@ -363,11 +363,19 @@ class EthRubberBand(BaseStrategy):
         スパイクが出ない静かな市場で機能する代替戦略。
         30日BT (n=22): WR=68.2%, EV=+0.179%, 約1件/日
 
+        追加フィルター (2026-02-21 強化):
+          4. RSI < 55 (中立以下: 底値圏でのLONGは過買いでないこと)
+          5. 価格モメンタム > -0.2% (急落中のナイフキャッチ禁止)
+          6. BBスクイーズ OR ボディ品質 >= 0.25 (コンソリ/方向性足を優先)
+
         条件:
           1. EMA9 > EMA21 (GOLDEN クロス: 短期上昇トレンド)
              ※ quiet_long_use_4h_ema=true 時: 5m DEAD でも 4H EMA GOLDEN なら許可
-          2. 4H range pos < quiet_long_h4_max_pct (底値圏: デフォルト35%)
+          2. 4H range pos < quiet_long_h4_max_pct (底値圏: デフォルト45%)
           3. 直近N本/長期M本 出来高比 < quiet_long_vol_ratio_max (低出来高: デフォルト0.60)
+          4. RSI14 < 55 (過買い除外: 底値圏でRSI高すぎは追い玉禁止)
+          5. 直近6本の価格モメンタム > -0.2% (急落中のナイフキャッチ禁止)
+          6. ボディ品質 >= 0.25 OR BBスクイーズ (ドジ足ノイズ状態を除外)
         """
         h4_window = self.cfg["h4_window"]
         h4_max_pct = self.cfg.get("quiet_long_h4_max_pct", 35)
@@ -443,20 +451,59 @@ class EthRubberBand(BaseStrategy):
         if vol_ratio >= vol_ratio_max:
             return None
 
+        # 4. RSIフィルター: 底値圏でもRSI過熱(>=55)でのLONG禁止
+        rsi = self._rsi(idx, period=14)
+        if rsi is not None and rsi >= 55.0:
+            logger.info(
+                "Pattern C: SKIP (RSI=%.1f >= 55, 底値圏でのRSI過熱 → LONGエッジ低下)",
+                rsi,
+            )
+            return None
+
+        # 5. 価格モメンタム: 急落中のナイフキャッチ禁止
+        momentum = self._price_momentum(idx, window=6)
+        if momentum < -0.20:
+            logger.info(
+                "Pattern C: SKIP (momentum=%.3f%% < -0.20%%, 急落中のナイフキャッチ禁止)",
+                momentum,
+            )
+            return None
+
+        # 6. ボディ品質チェック: ドジ足ノイズ状態を除外
+        body_q = self._candle_body_ratio(idx, window=3)
+        bb_squeeze = self._bb_squeeze(idx, window=20)
+        if body_q < 0.25 and not bb_squeeze:
+            logger.info(
+                "Pattern C: SKIP (body_ratio=%.2f < 0.25, BBスクイーズなし: ドジ足ノイズ)",
+                body_q,
+            )
+            return None
+
         tp_price = round(entry * (1 + tp_pct), 2)
         sl_price = round(entry * (1 - sl_pct), 2)
 
-        # 4H EMAのみの場合はconfidenceを下げて保守的に
-        confidence = 0.75 if ema_golden_5m else 0.72
-        ema_source = "5m" if ema_golden_5m else "4H"
+        # confidenceの決定:
+        # BBスクイーズ + 5m GOLDEN: 最高品質 0.75
+        # 5m GOLDEN のみ: 0.75 (変更なし)
+        # 4H EMAのみ (5m DEAD): 保守的 0.72
+        if ema_golden_5m:
+            confidence = 0.75
+            ema_source = "5m"
+        else:
+            confidence = 0.72
+            ema_source = "4H"
 
         # CAPS: confidence 0.75 → 2x, 0.72 → 1x (低確信度quiet系は縮小サイズ)
         leverage = self.confidence_to_leverage(confidence)
 
+        rsi_str = f"RSI={rsi:.1f}" if rsi is not None else "RSI=n/a"
+        squeeze_str = "BB_squeeze" if bb_squeeze else f"body={body_q:.2f}"
         logger.info(
             "Pattern C (quiet_long): ema_src=%s ema9=%.2f>ema21=%.2f, pos=%.1f%% < %d%%, "
-            "vol_ratio(5/100)=%.2f < %.2f → LONG TP %.1f%% SL %.1f%% [CAPS: conf=%.2f → %dx]",
-            ema_source, ema9, ema21, pos, h4_max_pct, vol_ratio, vol_ratio_max,
+            "vol_ratio(5/100)=%.2f, %s, mom=%.3f%%, %s "
+            "→ LONG TP %.1f%% SL %.1f%% [CAPS: conf=%.2f → %dx]",
+            ema_source, ema9, ema21, pos, h4_max_pct, vol_ratio,
+            rsi_str, momentum, squeeze_str,
             tp_pct * 100, sl_pct * 100, confidence, leverage,
         )
 
@@ -473,6 +520,7 @@ class EthRubberBand(BaseStrategy):
                 f"EthRubberBand C: quiet_long ({ema_source} GOLDEN), "
                 f"ema9={ema9:.2f}>ema21={ema21:.2f}, "
                 f"4H_pos={pos:.1f}%, vol_ratio(5/100)={vol_ratio:.2f}, "
+                f"{rsi_str}, mom={momentum:.3f}%, {squeeze_str}, "
                 f"→ LONG TP {tp_pct*100:.1f}% SL {sl_pct*100:.1f}% {cut_bars}bar cut "
                 f"[CAPS: {leverage}x]"
             ),

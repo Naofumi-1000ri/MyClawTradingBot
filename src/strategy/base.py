@@ -178,6 +178,146 @@ class BaseStrategy:
         else:
             return max(1, base_leverage - 2)
 
+    def _rsi(self, idx: int, period: int = 14) -> float | None:
+        """RSI (Relative Strength Index) を計算。
+
+        Args:
+            idx: 対象足のインデックス
+            period: RSI計算窓 (デフォルト14本)
+
+        Returns:
+            RSI値 (0-100)。データ不足時はNone。
+        """
+        needed = period + 1
+        start = max(0, idx - needed * 2 + 1)  # 余裕をもって取得
+        closes = [self.candles[i]["c"] for i in range(start, idx + 1)]
+        if len(closes) < needed:
+            return None
+
+        gains = []
+        losses = []
+        for i in range(1, len(closes)):
+            delta = closes[i] - closes[i - 1]
+            if delta > 0:
+                gains.append(delta)
+                losses.append(0.0)
+            else:
+                gains.append(0.0)
+                losses.append(abs(delta))
+
+        if len(gains) < period:
+            return None
+
+        avg_gain = sum(gains[-period:]) / period
+        avg_loss = sum(losses[-period:]) / period
+
+        if avg_loss == 0:
+            return 100.0
+        rs = avg_gain / avg_loss
+        return 100.0 - (100.0 / (1.0 + rs))
+
+    def _price_momentum(self, idx: int, window: int = 6) -> float:
+        """直近N本の価格変化率の合計 (方向モメンタム)。
+
+        プラスなら上昇モメンタム、マイナスなら下落モメンタム。
+        スパイクなし環境でトレンド方向を確認するために使用。
+
+        Args:
+            idx: 対象足のインデックス
+            window: 計算窓 (デフォルト6本=30分)
+
+        Returns:
+            直近window本の終値変化率の合計 (%)
+        """
+        start = max(0, idx - window)
+        if start >= idx:
+            return 0.0
+        base = self.candles[start]["c"]
+        current = self.candles[idx]["c"]
+        if base <= 0:
+            return 0.0
+        return (current - base) / base * 100.0
+
+    def _bb_squeeze(
+        self,
+        idx: int,
+        window: int = 20,
+        mult: float = 2.0,
+        squeeze_ratio: float = 0.6,
+    ) -> bool:
+        """ボリンジャーバンドのスクイーズ (収縮) を検出。
+
+        直近windowの BB幅 が 長期windowのBB幅平均に対して
+        squeeze_ratio 以下なら「スクイーズ状態」と判定。
+        スクイーズ = 価格レンジが収縮 = ブレイクアウト前の静寂。
+
+        Args:
+            idx: 対象足のインデックス
+            window: BB計算窓 (デフォルト20本)
+            mult: バンド幅の標準偏差倍率 (デフォルト2.0)
+            squeeze_ratio: スクイーズ判定比率 (デフォルト0.6: 60%以下)
+
+        Returns:
+            True = スクイーズ中 (低ボラ・コンソリデーション)
+        """
+        needed = window * 2
+        if idx < needed:
+            return False
+
+        def _bb_width(candles_slice: list[dict]) -> float:
+            closes = [c["c"] for c in candles_slice]
+            mean = sum(closes) / len(closes)
+            variance = sum((x - mean) ** 2 for x in closes) / len(closes)
+            std = variance ** 0.5
+            upper = mean + mult * std
+            lower = mean - mult * std
+            return (upper - lower) / mean if mean > 0 else 0.0
+
+        # 現在のBB幅
+        current_slice = self.candles[max(0, idx - window + 1):idx + 1]
+        if len(current_slice) < window:
+            return False
+        current_width = _bb_width(current_slice)
+
+        # 長期の平均BB幅 (window本前の同窓)
+        past_start = max(0, idx - window * 2 + 1)
+        past_end = max(0, idx - window + 1)
+        past_slice = self.candles[past_start:past_end + window]
+        if len(past_slice) < window:
+            return False
+        past_width = _bb_width(past_slice)
+
+        if past_width <= 0:
+            return False
+        return (current_width / past_width) <= squeeze_ratio
+
+    def _candle_body_ratio(self, idx: int, window: int = 3) -> float:
+        """直近N本の平均ボディ/レンジ比率。
+
+        0.0 = 全部ドジ足 (方向性なし)
+        1.0 = 全部ロングボディ足 (方向性あり)
+
+        スパイクなし環境でのエントリー前に方向性のある値動きかを確認。
+        ドジ足が多い = ノイズ状態 → quiet系パターン発火を抑制。
+
+        Args:
+            idx: 対象足のインデックス
+            window: 計算窓 (デフォルト3本=15分)
+
+        Returns:
+            平均ボディ比率 (0.0 - 1.0)
+        """
+        start = max(0, idx - window + 1)
+        chunk = self.candles[start:idx + 1]
+        if not chunk:
+            return 0.5
+        ratios = []
+        for c in chunk:
+            body = abs(c["c"] - c["o"])
+            rng = c["h"] - c["l"]
+            ratios.append(body / rng if rng > 0 else 0.0)
+        return sum(ratios) / len(ratios)
+
     def scan(self) -> dict | None:
         """サブクラスで実装。シグナルまたはNoneを返す。"""
         raise NotImplementedError

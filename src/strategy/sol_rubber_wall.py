@@ -268,11 +268,19 @@ class SolRubberWall(BaseStrategy):
         スパイクなしの静かな市場で4H高値圏に達した時のショート戦略。
         2026-02-21 BT: 4H pos>75% + GOLDEN + vol5/100<0.50x → n=76 WR=40.8%, PF=2.91
 
+        追加フィルター (2026-02-21 強化):
+          5. RSI > 55 (高値圏での疲労確認: RSI中立以上でないと意味なし)
+          6. 価格モメンタム < 0.2% (急騰中のSHORTは危険: 上昇モメンタムが弱いこと)
+          7. BBスクイーズ OR ボディ品質 >= 0.25 (コンソリ/方向性足を優先)
+
         条件:
           1. EMA9 > EMA21 (GOLDEN: 上昇トレンド確認 = 高値圏に到達している状態)
-          2. 4H range pos >= quiet_short_h4_min_pct (高位ゾーン: デフォルト75%)
+          2. 4H range pos >= quiet_short_h4_min_pct (高位ゾーン: デフォルト70%)
           3. 直近N本/長期M本 出来高比 < quiet_short_vol_ratio_max (低出来高: デフォルト0.50)
           4. funding_rate フィルター (極端なネガティブfunding時はSHORT禁止)
+          5. RSI14 > 55 (疲労確認: 高値圏でRSIが中立以上)
+          6. 直近6本の価格モメンタム < 0.20% (急騰中のSHORT禁止)
+          7. ボディ品質 >= 0.25 OR BBスクイーズ (ドジ足ノイズ状態を除外)
         """
         h4_window = self.cfg["h4_window"]
         h4_min_pct = self.cfg.get("quiet_short_h4_min_pct", 75)
@@ -333,17 +341,51 @@ class SolRubberWall(BaseStrategy):
         if vol_ratio >= vol_ratio_max:
             return None
 
+        # 5. RSIフィルター: 高値圏でRSI疲労(>55)を確認 (中立以下はまだ上昇余地あり)
+        rsi = self._rsi(idx, period=14)
+        if rsi is not None and rsi <= 55.0:
+            logger.info(
+                "Pattern E: SKIP (RSI=%.1f <= 55, 高値圏でまだRSI低め → SHORT早すぎ)",
+                rsi,
+            )
+            return None
+
+        # 6. 価格モメンタム: 急騰中のSHORT禁止 (上昇モメンタムが強い場合はSKIP)
+        momentum = self._price_momentum(idx, window=6)
+        if momentum > 0.20:
+            logger.info(
+                "Pattern E: SKIP (momentum=%.3f%% > 0.20%%, 急騰中のSHORT禁止)",
+                momentum,
+            )
+            return None
+
+        # 7. ボディ品質チェック: ドジ足ノイズ状態を除外
+        body_q = self._candle_body_ratio(idx, window=3)
+        bb_squeeze = self._bb_squeeze(idx, window=20)
+        if body_q < 0.25 and not bb_squeeze:
+            logger.info(
+                "Pattern E: SKIP (body_ratio=%.2f < 0.25, BBスクイーズなし: ドジ足ノイズ)",
+                body_q,
+            )
+            return None
+
         tp_price = round(entry * (1 - tp_pct), 4)
         sl_price = round(entry * (1 + sl_pct), 4)
 
-        # CAPS: confidence=0.72 (低確信度) → leverage=1x (縮小サイズ)
-        confidence = 0.72
+        # CAPS: RSI高め(>65) + 下落モメンタム → confidence上げて2x
+        # それ以外は conservative 0.72 → 1x
+        has_quality = (rsi is not None and rsi > 65.0) or (momentum < 0.0 and bb_squeeze)
+        confidence = 0.75 if has_quality else 0.72
         leverage = self.confidence_to_leverage(confidence)
 
+        rsi_str = f"RSI={rsi:.1f}" if rsi is not None else "RSI=n/a"
+        squeeze_str = "BB_squeeze" if bb_squeeze else f"body={body_q:.2f}"
         logger.info(
             "Pattern E (quiet_short): ema9=%.4f>ema21=%.4f, pos=%.1f%% >= %d%%, "
-            "vol_ratio(5/100)=%.2f < %.2f → SHORT TP %.1f%% SL %.1f%% [CAPS: conf=%.2f → %dx]",
-            ema9, ema21, pos, h4_min_pct, vol_ratio, vol_ratio_max,
+            "vol_ratio(5/100)=%.2f, %s, mom=%.3f%%, %s "
+            "→ SHORT TP %.1f%% SL %.1f%% [CAPS: conf=%.2f → %dx]",
+            ema9, ema21, pos, h4_min_pct, vol_ratio,
+            rsi_str, momentum, squeeze_str,
             tp_pct * 100, sl_pct * 100, confidence, leverage,
         )
 
@@ -360,6 +402,7 @@ class SolRubberWall(BaseStrategy):
                 f"SolRubberWall E: quiet_short, "
                 f"ema9={ema9:.4f}>ema21={ema21:.4f}, "
                 f"4H_pos={pos:.1f}%, vol_ratio(5/100)={vol_ratio:.2f}, "
+                f"{rsi_str}, mom={momentum:.3f}%, {squeeze_str}, "
                 f"→ SHORT TP {tp_pct*100:.1f}% SL {sl_pct*100:.1f}% {exit_bars}bar cut "
                 f"[CAPS: {leverage}x]"
             ),
