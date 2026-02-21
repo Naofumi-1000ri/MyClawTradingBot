@@ -6,7 +6,7 @@
 最適化: 毎サイクル全足スキャンせず、次の足の閾値volumeを事前計算。
 キャッシュヒット時は O(1) で判定完了。
 
-ゾーン:
+ゾーン (スパイクあり):
   貫通    (-20% ~ 0%):   LONG   TP 0.3%  SL 0.6% (30日分 vol>=5x: LONG_wr=55%, PF=2.33)
                           exit_bars=12 (60分タイムアウト。legacyで36時間漂流した教訓)
   レンジ上  (40% ~):       SHORT  TP 0.5%  SL 0.6% (30日分 vol>=5x: SHORT_wr=59%, EV=+0.049%)
@@ -15,6 +15,19 @@
   底付近   (0% ~ 20%):    SHORT  TP 0.4%  SL 0.6%  vol>=7.0のみ (SHORT_wr=55%。BTCノイズ幅0.3-0.5%に対してSL0.5%は狭すぎた)
                           exit_bars=8 (40分タイムアウト。底付近は短期勝負)
   中間     (20% ~ 40%):   SKIP   (ゾーン下寄りでSHORT期待値が不明確。旧20~40%は廃止)
+
+パターン D (quiet_long):  スパイクなし + 低出来高 + 4H高位 + GOLDEN → LONG (静観脱却)
+  - 2026-02-21 バックテスト: 4H pos>70% + GOLDEN + vol5/100<0.3x → 13件中85%上昇
+  - 平均上昇幅 +0.32%。TP=0.3%/SL=0.5%/exit_bars=8 (40分) 設定
+  - BEARスパイク不要: 静かな上昇トレンド継続中に順張りエントリー
+  - vol_ratio_max=0.40 (直近5本/100本平均): 出来高が平均以下の静かな市場のみ
+  - 4H高位 (pos>=70%): 上昇トレンド継続ゾーン (レンジ突破方向への順張り)
+  - 頻度: 1日1-2回 (スパイク待ち静観を打破する補助戦略)
+
+2026-02-21 quiet_long追加:
+  - 静観率90%以上の問題に対する補助戦略として実装
+  - ETH Pattern C (quiet_long) の成功を参考に BTC 版を導入
+  - BTC バックテスト根拠: 4H高位(>70%) + GOLDEN + vol<0.3x → 13件avg+0.32%
 
 2026-02-21 exit_bars追加:
   - penetration LONG: legacy BTCが36時間漂流→SLヒット -$0.24 の教訓
@@ -61,6 +74,17 @@ _DEFAULT_CONFIG = {
     "vol_threshold": 5.0,   # 旧7.0→5.0: 30日バックテストで upper 59%勝率、機会損失削減
     "h4_window": 48,
     "vol_window": 288,
+    # Pattern D: quiet_long (静観脱却)
+    # 2026-02-21 BT: 4H pos>70% + GOLDEN + vol5/100<0.3x → n=13 avg+0.32%上昇
+    # ETH Pattern C の成功を参考にBTC版を実装
+    "quiet_long_enabled": True,
+    "quiet_long_h4_min_pct": 70,        # 4H pos >= 70% (上昇トレンド継続ゾーン)
+    "quiet_long_vol_ratio_max": 0.40,   # 直近5本/100本 < 0.40 (平均以下の静かな出来高)
+    "quiet_long_vol_short_window": 5,   # 直近N本平均 (分子)
+    "quiet_long_vol_long_window": 100,  # 比較対象M本平均 (分母)
+    "quiet_long_tp_pct": 0.003,         # TP 0.3% (BT avg+0.32%に対して保守的設定)
+    "quiet_long_sl_pct": 0.005,         # SL 0.5% (R:R=0.6。底付近SL0.6%より狭い高位ゾーン設定)
+    "quiet_long_exit_bars": 8,          # 8bar=40分タイムアウト (静かな市場は短期決着)
     "zones": {
         # penetration: LONG変更 (旧SHORT)
         # 30日BT BEAR spike>=5x: LONG_wr=55%, TP0.3%/SL0.6%でPF=2.33
@@ -132,6 +156,11 @@ class BtcRubberWall(BaseStrategy):
 
             if candle["v"] < threshold_vol or not is_bear:
                 next_cache = self._build_next_cache(idx)
+                # スパイクなし → Pattern D (quiet_long) を確認
+                if self.cfg.get("quiet_long_enabled", True):
+                    sig_d = self._pattern_d_quiet_long(idx, candle)
+                    if sig_d:
+                        return sig_d, next_cache
                 return None, next_cache
 
             # スパイク検知 — ログ用に実際の ratio を計算
@@ -144,6 +173,11 @@ class BtcRubberWall(BaseStrategy):
 
             if ratio < vol_threshold or not is_bear:
                 next_cache = self._build_next_cache(idx)
+                # スパイクなし → Pattern D (quiet_long) を確認
+                if self.cfg.get("quiet_long_enabled", True):
+                    sig_d = self._pattern_d_quiet_long(idx, candle)
+                    if sig_d:
+                        return sig_d, next_cache
                 return None, next_cache
 
             logger.info("BEAR spike detected: vol_ratio=%.1f, change=%.2f%%",
@@ -228,6 +262,103 @@ class BtcRubberWall(BaseStrategy):
         logger.info("Signal: %s %s @ %.2f, TP=%.2f, SL=%.2f (zone=%s)",
                      direction, "BTC", entry_price, tp_price, sl_price, matched_zone)
         return signal, next_cache
+
+    def _pattern_d_quiet_long(self, idx: int, candle: dict) -> dict | None:
+        """Pattern D: 低出来高 + GOLDEN クロス + 4H高位 → LONG (quiet_long)。
+
+        スパイクが出ない静かな市場でトレンド順張りする補助戦略。
+        2026-02-21 BT: 4H pos>70% + GOLDEN + vol5/100<0.3x → n=13 avg+0.32%上昇
+
+        条件:
+          1. EMA9 > EMA21 (GOLDEN: 上昇トレンド確認)
+          2. 4H range pos >= quiet_long_h4_min_pct (高位ゾーン: デフォルト70%)
+          3. 直近N本/長期M本 出来高比 < quiet_long_vol_ratio_max (低出来高: デフォルト0.40)
+        """
+        h4_window = self.cfg["h4_window"]
+        h4_min_pct = self.cfg.get("quiet_long_h4_min_pct", 70)
+        vol_ratio_max = self.cfg.get("quiet_long_vol_ratio_max", 0.40)
+        short_w = self.cfg.get("quiet_long_vol_short_window", 5)
+        long_w = self.cfg.get("quiet_long_vol_long_window", 100)
+        tp_pct = self.cfg.get("quiet_long_tp_pct", 0.003)
+        sl_pct = self.cfg.get("quiet_long_sl_pct", 0.005)
+        exit_bars = self.cfg.get("quiet_long_exit_bars", 8)
+
+        # EMA計算
+        def _ema(prices: list[float], period: int) -> float:
+            k = 2.0 / (period + 1)
+            e = prices[0]
+            for p in prices[1:]:
+                e = p * k + e * (1 - k)
+            return e
+
+        # 1. EMA GOLDEN クロス確認
+        if idx < 21:
+            return None
+        closes = [c["c"] for c in self.candles[max(0, idx - 30):idx + 1]]
+        if len(closes) < 22:
+            return None
+
+        ema9 = _ema(closes, 9)
+        ema21 = _ema(closes, 21)
+        if ema9 <= ema21:
+            return None
+
+        # 2. 4H range position (高位ゾーン確認: pos >= h4_min_pct)
+        h4_low, h4_high = self._h4_range(idx - 1, h4_window)
+        entry = candle["c"]
+        pos = self._range_position(entry, h4_low, h4_high)
+        if pos < h4_min_pct:
+            return None
+
+        # 3. 低出来高チェック (直近N本/長期M本 < 閾値)
+        short_start = max(0, idx - short_w + 1)
+        short_vols = [self.candles[j]["v"] for j in range(short_start, idx + 1)]
+        long_start = max(0, idx - long_w + 1)
+        long_vols = [self.candles[j]["v"] for j in range(long_start, idx + 1)]
+        short_avg = sum(short_vols) / len(short_vols) if short_vols else 0
+        long_avg = sum(long_vols) / len(long_vols) if long_vols else 0
+        if long_avg <= 0:
+            return None
+        vol_ratio = short_avg / long_avg
+        if vol_ratio >= vol_ratio_max:
+            return None
+
+        tp_price = round(entry * (1 + tp_pct), 2)
+        sl_price = round(entry * (1 - sl_pct), 2)
+
+        logger.info(
+            "Pattern D (quiet_long): ema9=%.2f>ema21=%.2f, pos=%.1f%% >= %d%%, "
+            "vol_ratio(5/100)=%.2f < %.2f → LONG TP %.1f%% SL %.1f%%",
+            ema9, ema21, pos, h4_min_pct, vol_ratio, vol_ratio_max,
+            tp_pct * 100, sl_pct * 100,
+        )
+
+        signal = {
+            "symbol": "BTC",
+            "action": "long",
+            "direction": "long",
+            "confidence": 0.72,
+            "entry_price": round(entry, 2),
+            "take_profit": tp_price,
+            "stop_loss": sl_price,
+            "leverage": 3,
+            "reasoning": (
+                f"BtcRubberWall D: quiet_long, "
+                f"ema9={ema9:.2f}>ema21={ema21:.2f}, "
+                f"4H_pos={pos:.1f}%, vol_ratio(5/100)={vol_ratio:.2f}, "
+                f"→ LONG TP {tp_pct*100:.1f}% SL {sl_pct*100:.1f}% {exit_bars}bar cut"
+            ),
+            "zone": "quiet_high",
+            "pattern": "D_quiet_long",
+            "exit_mode": "time_cut",
+            "exit_bars": exit_bars,
+            "range_position": round(pos, 1),
+            "vol_ratio": round(vol_ratio, 2),
+            "spike_time": candle["t"],
+        }
+        logger.info("Signal: long BTC @ %.2f, TP=%.2f, SL=%.2f (quiet_long, exit=%dbar)",
+                    entry, tp_price, sl_price, exit_bars)
+        return signal
 
     def _vol_ratio_single(self, idx: int) -> float:
         """単一足の出来高比率を計算。O(window)。"""

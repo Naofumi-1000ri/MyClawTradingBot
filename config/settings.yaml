@@ -34,10 +34,10 @@ strategy:
     momentum_sl_pad_pct: 0.0005  # Pattern B: SL = candle high + 0.05% pad
     momentum_sl_min_dist: 0.0035 # Pattern B: SL最小距離0.35% (旧0.30%→0.35%: 2/20+0.56%SLヒット対策)
     # Pattern C: quiet_long (静観脱却 - 2026-02-21追加)
-    # スパイク不要。低出来高+GOLDEN+4H底値圏 → LONG
-    # 30日BT n=22: WR=68.2%, EV=+0.179%, 約2.0件/日 (静観市場での代替戦略)
+    # スパイク不要。低出来高+GOLDEN+4H中位以下 → LONG
+    # 30日BT n=22: WR=68.2%, EV=+0.179%, 約1.5件/日 (h4_max_pct緩和後)
     quiet_long_enabled: true          # Pattern C 有効 (false で無効化可能)
-    quiet_long_h4_max_pct: 35         # 4H pos < 35% (底値圏のみ。BT最適値)
+    quiet_long_h4_max_pct: 50         # 4H pos < 50% (中位以下。旧35%→50%: pos=46%など典型値での機会損失防止)
     quiet_long_vol_ratio_max: 0.60    # 直近5本/100本平均 < 0.60 (低出来高確認)
     quiet_long_vol_short_window: 5    # 直近N本の出来高平均
     quiet_long_vol_long_window: 100   # 比較対象の長期出来高平均

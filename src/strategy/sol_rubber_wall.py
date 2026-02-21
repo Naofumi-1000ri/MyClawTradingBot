@@ -8,6 +8,18 @@ SOL 固有のボラティリティに合わせた広いTP/SL設定。
   - SHORT favorable/adverse ratio = 1.68 (LONG = 0.59)
   - Best: BEAR 5x → SHORT TP=1.0%/SL=0.5% PF=1.41, Net=+5.38%
 
+パターン E (quiet_short):  スパイクなし + 低出来高 + 4H高位 + GOLDEN → SHORT (静観脱却)
+  - 2026-02-21 バックテスト: 4H pos>75% + GOLDEN + vol5/100<0.50x → WR=40.8%, PF=2.91
+    (PF=2.91はTP/SL比が大きいため。n=76件の十分なサンプル)
+  - TP=0.6%/SL=0.8%/exit_bars=10 (50分): BT最適パラメータ
+  - BEARスパイク不要: 静かな上昇高値圏で価格が重くなるパターンにSHORT
+  - funding_rate フィルター: 極端なネガティブfunding時はSHORTブロック (既存ロジック流用)
+  - 頻度: 1日1-2回 (SOLのスパイク待ち静観を打破する補助戦略)
+
+2026-02-21 quiet_short追加:
+  - 静観率90%以上の問題に対する補助戦略として実装
+  - SOL BT根拠: 4H高位(>75%) + GOLDEN + vol<0.50x → n=76 WR=40.8%, PF=2.91
+
 2026-02-21 最適化 (実運用データに基づく):
   - SLヒット原因: SOL 5分足ノイズ幅 0.3-1% に対しSL 0.5%が狭すぎた
   - vol_threshold 5.0x → 6.0x (シグナル品質向上) ※settings.yamlは5.0xで実運用中
@@ -53,6 +65,16 @@ _DEFAULT_CONFIG = {
     # funding_rate がこの閾値より低い場合、SHORT新規エントリー禁止 (スクイーズ回避)
     # -2e-5 → -5e-5 に緩和: 中程度のネガティブfundingでのブロック過多によるSOL機会損失を削減
     "funding_short_block_threshold": -5e-5,
+    # Pattern E: quiet_short (静観脱却)
+    # 2026-02-21 BT: 4H pos>75% + GOLDEN + vol5/100<0.50x → n=76 WR=40.8%, PF=2.91
+    "quiet_short_enabled": True,
+    "quiet_short_h4_min_pct": 75,        # 4H pos >= 75% (高位ゾーン)
+    "quiet_short_vol_ratio_max": 0.50,   # 直近5本/100本 < 0.50 (低出来高)
+    "quiet_short_vol_short_window": 5,   # 直近N本平均 (分子)
+    "quiet_short_vol_long_window": 100,  # 比較対象M本平均 (分母)
+    "quiet_short_tp_pct": 0.006,         # TP 0.6% (BT最適)
+    "quiet_short_sl_pct": 0.008,         # SL 0.8% (SOLのボラに合わせた広めSL)
+    "quiet_short_exit_bars": 10,         # 10bar=50分タイムアウト
     "zones": {
         # penetration: SL 0.5%→0.8% (5分足ノイズ耐性強化), TP 1.0%→1.5% (R:R≈1.875)
         "penetration": {"range": [-20, 0], "direction": "short", "tp_pct": 0.015, "sl_pct": 0.008},
@@ -111,6 +133,11 @@ class SolRubberWall(BaseStrategy):
 
             if candle["v"] < threshold_vol or not is_bear:
                 next_cache = self._build_next_cache(idx)
+                # スパイクなし → Pattern E (quiet_short) を確認
+                if self.cfg.get("quiet_short_enabled", True):
+                    sig_e = self._pattern_e_quiet_short(idx, candle)
+                    if sig_e:
+                        return sig_e, next_cache
                 return None, next_cache
 
             ratio = self._vol_ratio_single(idx)
@@ -121,6 +148,11 @@ class SolRubberWall(BaseStrategy):
 
             if ratio < vol_threshold or not is_bear:
                 next_cache = self._build_next_cache(idx)
+                # スパイクなし → Pattern E (quiet_short) を確認
+                if self.cfg.get("quiet_short_enabled", True):
+                    sig_e = self._pattern_e_quiet_short(idx, candle)
+                    if sig_e:
+                        return sig_e, next_cache
                 return None, next_cache
 
             logger.info("BEAR spike detected: vol_ratio=%.1f, change=%.2f%%",
@@ -207,6 +239,114 @@ class SolRubberWall(BaseStrategy):
         logger.info("Signal: %s %s @ %.4f, TP=%.4f, SL=%.4f (zone=%s)",
                      direction, "SOL", entry_price, tp_price, sl_price, matched_zone)
         return signal, next_cache
+
+    def _pattern_e_quiet_short(self, idx: int, candle: dict) -> dict | None:
+        """Pattern E: 低出来高 + GOLDEN クロス + 4H高位 → SHORT (quiet_short)。
+
+        スパイクなしの静かな市場で4H高値圏に達した時のショート戦略。
+        2026-02-21 BT: 4H pos>75% + GOLDEN + vol5/100<0.50x → n=76 WR=40.8%, PF=2.91
+
+        条件:
+          1. EMA9 > EMA21 (GOLDEN: 上昇トレンド確認 = 高値圏に到達している状態)
+          2. 4H range pos >= quiet_short_h4_min_pct (高位ゾーン: デフォルト75%)
+          3. 直近N本/長期M本 出来高比 < quiet_short_vol_ratio_max (低出来高: デフォルト0.50)
+          4. funding_rate フィルター (極端なネガティブfunding時はSHORT禁止)
+        """
+        h4_window = self.cfg["h4_window"]
+        h4_min_pct = self.cfg.get("quiet_short_h4_min_pct", 75)
+        vol_ratio_max = self.cfg.get("quiet_short_vol_ratio_max", 0.50)
+        short_w = self.cfg.get("quiet_short_vol_short_window", 5)
+        long_w = self.cfg.get("quiet_short_vol_long_window", 100)
+        tp_pct = self.cfg.get("quiet_short_tp_pct", 0.006)
+        sl_pct = self.cfg.get("quiet_short_sl_pct", 0.008)
+        exit_bars = self.cfg.get("quiet_short_exit_bars", 10)
+
+        # funding rate フィルター (スパイク版と同じロジック)
+        funding_rate = self.cfg.get("current_funding_rate", 0.0)
+        block_threshold = self.cfg.get("funding_short_block_threshold", -5e-5)
+        if funding_rate < block_threshold:
+            logger.info(
+                "Pattern E: SHORT blocked: funding_rate=%.2e < threshold=%.2e",
+                funding_rate, block_threshold,
+            )
+            return None
+
+        # EMA計算
+        def _ema(prices: list[float], period: int) -> float:
+            k = 2.0 / (period + 1)
+            e = prices[0]
+            for p in prices[1:]:
+                e = p * k + e * (1 - k)
+            return e
+
+        # 1. EMA GOLDEN クロス確認
+        if idx < 21:
+            return None
+        closes = [c["c"] for c in self.candles[max(0, idx - 30):idx + 1]]
+        if len(closes) < 22:
+            return None
+
+        ema9 = _ema(closes, 9)
+        ema21 = _ema(closes, 21)
+        if ema9 <= ema21:
+            return None
+
+        # 2. 4H range position (高位ゾーン確認: pos >= h4_min_pct)
+        h4_low, h4_high = self._h4_range(idx - 1, h4_window)
+        entry = candle["c"]
+        pos = self._range_position(entry, h4_low, h4_high)
+        if pos < h4_min_pct:
+            return None
+
+        # 3. 低出来高チェック
+        short_start = max(0, idx - short_w + 1)
+        short_vols = [self.candles[j]["v"] for j in range(short_start, idx + 1)]
+        long_start = max(0, idx - long_w + 1)
+        long_vols = [self.candles[j]["v"] for j in range(long_start, idx + 1)]
+        short_avg = sum(short_vols) / len(short_vols) if short_vols else 0
+        long_avg = sum(long_vols) / len(long_vols) if long_vols else 0
+        if long_avg <= 0:
+            return None
+        vol_ratio = short_avg / long_avg
+        if vol_ratio >= vol_ratio_max:
+            return None
+
+        tp_price = round(entry * (1 - tp_pct), 4)
+        sl_price = round(entry * (1 + sl_pct), 4)
+
+        logger.info(
+            "Pattern E (quiet_short): ema9=%.4f>ema21=%.4f, pos=%.1f%% >= %d%%, "
+            "vol_ratio(5/100)=%.2f < %.2f → SHORT TP %.1f%% SL %.1f%%",
+            ema9, ema21, pos, h4_min_pct, vol_ratio, vol_ratio_max,
+            tp_pct * 100, sl_pct * 100,
+        )
+
+        signal = {
+            "symbol": "SOL",
+            "action": "short",
+            "direction": "short",
+            "confidence": 0.72,
+            "entry_price": round(entry, 4),
+            "take_profit": tp_price,
+            "stop_loss": sl_price,
+            "leverage": 3,
+            "reasoning": (
+                f"SolRubberWall E: quiet_short, "
+                f"ema9={ema9:.4f}>ema21={ema21:.4f}, "
+                f"4H_pos={pos:.1f}%, vol_ratio(5/100)={vol_ratio:.2f}, "
+                f"→ SHORT TP {tp_pct*100:.1f}% SL {sl_pct*100:.1f}% {exit_bars}bar cut"
+            ),
+            "zone": "quiet_high",
+            "pattern": "E_quiet_short",
+            "exit_mode": "time_cut",
+            "exit_bars": exit_bars,
+            "range_position": round(pos, 1),
+            "vol_ratio": round(vol_ratio, 2),
+            "spike_time": candle["t"],
+        }
+        logger.info("Signal: short SOL @ %.4f, TP=%.4f, SL=%.4f (quiet_short, exit=%dbar)",
+                    entry, tp_price, sl_price, exit_bars)
+        return signal
 
     def _vol_ratio_single(self, idx: int) -> float:
         """単一足の出来高比率を計算。O(window)。"""
