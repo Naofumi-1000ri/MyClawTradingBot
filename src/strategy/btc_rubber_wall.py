@@ -347,27 +347,32 @@ class BtcRubberWall(BaseStrategy):
         tp_price = round(entry * (1 + tp_pct), 2)
         sl_price = round(entry * (1 - sl_pct), 2)
 
+        # CAPS: confidence=0.72 (低確信度) → leverage=1x (縮小サイズ)
+        confidence = 0.72
+        leverage = self.confidence_to_leverage(confidence)
+
         logger.info(
             "Pattern D (quiet_long): ema9=%.2f>ema21=%.2f, pos=%.1f%% >= %d%%, "
-            "vol_ratio(5/100)=%.2f < %.2f → LONG TP %.1f%% SL %.1f%%",
+            "vol_ratio(5/100)=%.2f < %.2f → LONG TP %.1f%% SL %.1f%% [CAPS: conf=%.2f → %dx]",
             ema9, ema21, pos, h4_min_pct, vol_ratio, vol_ratio_max,
-            tp_pct * 100, sl_pct * 100,
+            tp_pct * 100, sl_pct * 100, confidence, leverage,
         )
 
         signal = {
             "symbol": "BTC",
             "action": "long",
             "direction": "long",
-            "confidence": 0.72,
+            "confidence": confidence,
             "entry_price": round(entry, 2),
             "take_profit": tp_price,
             "stop_loss": sl_price,
-            "leverage": 3,
+            "leverage": leverage,
             "reasoning": (
                 f"BtcRubberWall D: quiet_long, "
                 f"ema9={ema9:.2f}>ema21={ema21:.2f}, "
                 f"4H_pos={pos:.1f}%, vol_ratio(5/100)={vol_ratio:.2f}, "
-                f"→ LONG TP {tp_pct*100:.1f}% SL {sl_pct*100:.1f}% {exit_bars}bar cut"
+                f"→ LONG TP {tp_pct*100:.1f}% SL {sl_pct*100:.1f}% {exit_bars}bar cut "
+                f"[CAPS: {leverage}x]"
             ),
             "zone": "quiet_high",
             "pattern": "D_quiet_long",

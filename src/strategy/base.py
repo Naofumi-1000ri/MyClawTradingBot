@@ -152,6 +152,32 @@ class BaseStrategy:
         else:
             return 1.0, "normal"
 
+    @staticmethod
+    def confidence_to_leverage(confidence: float, base_leverage: int = 3) -> int:
+        """Confidence-Adaptive Position Sizing (CAPS): confidence に応じてレバレッジを削減。
+
+        低確信度シグナル（quiet系パターン）に対して小さいレバレッジを返す。
+        高確信度シグナル（スパイク系）はbase_leverageをそのまま使用。
+
+        マッピング:
+          confidence >= 0.80: base_leverage (3x) - スパイク系 (Pattern A/B/main)
+          confidence >= 0.74: base_leverage - 1 (2x) - 中確信度 quiet (5m GOLDEN)
+          confidence < 0.74:  max(1, base_leverage - 2) (1x) - 低確信度 (4H EMAのみ等)
+
+        Args:
+            confidence: シグナルの確信度 (0.0 - 1.0)
+            base_leverage: 標準レバレッジ (デフォルト3)
+
+        Returns:
+            適用するレバレッジ整数値 (最小1)
+        """
+        if confidence >= 0.80:
+            return base_leverage
+        elif confidence >= 0.74:
+            return max(1, base_leverage - 1)
+        else:
+            return max(1, base_leverage - 2)
+
     def scan(self) -> dict | None:
         """サブクラスで実装。シグナルまたはNoneを返す。"""
         raise NotImplementedError

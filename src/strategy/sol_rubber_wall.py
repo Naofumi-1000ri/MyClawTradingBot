@@ -336,27 +336,32 @@ class SolRubberWall(BaseStrategy):
         tp_price = round(entry * (1 - tp_pct), 4)
         sl_price = round(entry * (1 + sl_pct), 4)
 
+        # CAPS: confidence=0.72 (低確信度) → leverage=1x (縮小サイズ)
+        confidence = 0.72
+        leverage = self.confidence_to_leverage(confidence)
+
         logger.info(
             "Pattern E (quiet_short): ema9=%.4f>ema21=%.4f, pos=%.1f%% >= %d%%, "
-            "vol_ratio(5/100)=%.2f < %.2f → SHORT TP %.1f%% SL %.1f%%",
+            "vol_ratio(5/100)=%.2f < %.2f → SHORT TP %.1f%% SL %.1f%% [CAPS: conf=%.2f → %dx]",
             ema9, ema21, pos, h4_min_pct, vol_ratio, vol_ratio_max,
-            tp_pct * 100, sl_pct * 100,
+            tp_pct * 100, sl_pct * 100, confidence, leverage,
         )
 
         signal = {
             "symbol": "SOL",
             "action": "short",
             "direction": "short",
-            "confidence": 0.72,
+            "confidence": confidence,
             "entry_price": round(entry, 4),
             "take_profit": tp_price,
             "stop_loss": sl_price,
-            "leverage": 3,
+            "leverage": leverage,
             "reasoning": (
                 f"SolRubberWall E: quiet_short, "
                 f"ema9={ema9:.4f}>ema21={ema21:.4f}, "
                 f"4H_pos={pos:.1f}%, vol_ratio(5/100)={vol_ratio:.2f}, "
-                f"→ SHORT TP {tp_pct*100:.1f}% SL {sl_pct*100:.1f}% {exit_bars}bar cut"
+                f"→ SHORT TP {tp_pct*100:.1f}% SL {sl_pct*100:.1f}% {exit_bars}bar cut "
+                f"[CAPS: {leverage}x]"
             ),
             "zone": "quiet_high",
             "pattern": "E_quiet_short",

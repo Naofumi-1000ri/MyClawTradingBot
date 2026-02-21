@@ -462,6 +462,28 @@ def _run_rubber_wall(settings: dict, context: dict) -> bool:
     return all_scan_failed
 
 
+def _caps_leverage(confidence: float, sig_leverage: int | None, base: int = 3) -> int:
+    """Confidence-Adaptive Position Sizing (CAPS): confidence に応じたレバレッジを返す。
+
+    戦略側で既に設定済みの leverage を優先する。
+    未設定 (None) の場合は confidence から推定してフォールバック。
+
+    マッピング (base=3):
+      confidence >= 0.80: 3x (スパイク系)
+      confidence >= 0.74: 2x (中確信度 quiet)
+      confidence <  0.74: 1x (低確信度 quiet)
+    """
+    if sig_leverage is not None:
+        return int(sig_leverage)
+    # leverageが未指定の場合: confidenceから推定
+    if confidence >= 0.80:
+        return base
+    elif confidence >= 0.74:
+        return max(1, base - 1)
+    else:
+        return max(1, base - 2)
+
+
 def _signals_to_merged(signals: list[dict]) -> dict:
     """複数シグナルを signals.json 形式に変換。
 
@@ -469,21 +491,33 @@ def _signals_to_merged(signals: list[dict]) -> dict:
       action_type=hold として出力。executor は hold_position を誤解釈しない。
     trade/close シグナルが含まれる場合:
       action_type=trade として通常処理。
+
+    CAPS (Confidence-Adaptive Position Sizing):
+      各シグナルの confidence に基づいてレバレッジを検証・補正する。
+      戦略側で設定済みの leverage を優先し、未設定時のみ confidence から推定。
     """
     summaries = []
     sig_list = []
     for sig in signals:
         action = sig.get("direction", "hold")
         symbol = sig.get("symbol", "?")
+        confidence = sig.get("confidence", 0.85)
+        raw_leverage = sig.get("leverage")
+        leverage = _caps_leverage(confidence, raw_leverage)
+        if raw_leverage is not None and leverage != int(raw_leverage):
+            logger.info(
+                "CAPS: %s %s leverage override %d→%d (confidence=%.2f)",
+                action, symbol, raw_leverage, leverage, confidence,
+            )
         summaries.append(f"{action} {symbol} ({sig.get('zone', '?')})")
         sig_entry = {
             "symbol": symbol,
             "action": action,
-            "confidence": sig.get("confidence", 0.85),
+            "confidence": confidence,
             "entry_price": sig.get("entry_price"),
             "stop_loss": sig.get("stop_loss"),
             "take_profit": sig.get("take_profit"),
-            "leverage": sig.get("leverage", 3),
+            "leverage": leverage,
             "reasoning": sig.get("reasoning", ""),
         }
         # Rubber metadata → executor が position meta 保存に使用

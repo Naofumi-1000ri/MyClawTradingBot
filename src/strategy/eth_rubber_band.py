@@ -450,11 +450,14 @@ class EthRubberBand(BaseStrategy):
         confidence = 0.75 if ema_golden_5m else 0.72
         ema_source = "5m" if ema_golden_5m else "4H"
 
+        # CAPS: confidence 0.75 → 2x, 0.72 → 1x (低確信度quiet系は縮小サイズ)
+        leverage = self.confidence_to_leverage(confidence)
+
         logger.info(
             "Pattern C (quiet_long): ema_src=%s ema9=%.2f>ema21=%.2f, pos=%.1f%% < %d%%, "
-            "vol_ratio(5/100)=%.2f < %.2f → LONG TP %.1f%% SL %.1f%%",
+            "vol_ratio(5/100)=%.2f < %.2f → LONG TP %.1f%% SL %.1f%% [CAPS: conf=%.2f → %dx]",
             ema_source, ema9, ema21, pos, h4_max_pct, vol_ratio, vol_ratio_max,
-            tp_pct * 100, sl_pct * 100,
+            tp_pct * 100, sl_pct * 100, confidence, leverage,
         )
 
         signal = {
@@ -465,12 +468,13 @@ class EthRubberBand(BaseStrategy):
             "entry_price": round(entry, 2),
             "take_profit": tp_price,
             "stop_loss": sl_price,
-            "leverage": 3,
+            "leverage": leverage,
             "reasoning": (
                 f"EthRubberBand C: quiet_long ({ema_source} GOLDEN), "
                 f"ema9={ema9:.2f}>ema21={ema21:.2f}, "
                 f"4H_pos={pos:.1f}%, vol_ratio(5/100)={vol_ratio:.2f}, "
-                f"→ LONG TP {tp_pct*100:.1f}% SL {sl_pct*100:.1f}% {cut_bars}bar cut"
+                f"→ LONG TP {tp_pct*100:.1f}% SL {sl_pct*100:.1f}% {cut_bars}bar cut "
+                f"[CAPS: {leverage}x]"
             ),
             "zone": "quiet_bottom",
             "pattern": "C_quiet_long",
