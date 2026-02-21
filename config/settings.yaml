@@ -32,7 +32,7 @@ strategy:
     momentum_zone_min: 40        # Pattern B: 4H position >= 40% (30日BTで有効)
     momentum_cut_bars: 15        # Pattern B: 75分 (15bar) で時間カット
     momentum_sl_pad_pct: 0.0005  # Pattern B: SL = candle high + 0.05% pad
-    momentum_sl_min_dist: 0.003  # Pattern B: SL最小距離0.30%
+    momentum_sl_min_dist: 0.0035 # Pattern B: SL最小距離0.35% (旧0.30%→0.35%: 2/20+0.56%SLヒット対策)
     # Pattern C: quiet_long (静観脱却 - 2026-02-21追加)
     # スパイク不要。低出来高+GOLDEN+4H底値圏 → LONG
     # 30日BT n=22: WR=68.2%, EV=+0.179%, 約2.0件/日 (静観市場での代替戦略)
@@ -44,6 +44,7 @@ strategy:
     quiet_long_tp_pct: 0.004          # TP 0.4% (30日BT最適: TP0.4/SL0.6/10bar)
     quiet_long_sl_pct: 0.006          # SL 0.6%
     quiet_long_cut_bars: 10           # 10bar (50分) タイムアウト
+    quiet_long_use_4h_ema: true       # 5m DEAD でも 4H EMA GOLDEN なら発火許可 (confidence=0.72)
     h4_window: 48
     vol_window: 288
   sol_rubber_wall:               # SOL: BTC型ゴムの壁 (BEAR spike → SHORT メイン)
