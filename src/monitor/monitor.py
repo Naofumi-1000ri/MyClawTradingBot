@@ -13,8 +13,10 @@ logger = setup_logger("monitor")
 
 # Alert thresholds
 SIGNAL_STALE_SECONDS = 600  # 10 minutes
-RUBBER_FALLBACK_ALERT_MINUTES = 30  # Rubber fallback 継続アラート閾値
-RUBBER_FALLBACK_ALERT_COOLDOWN_MINUTES = 30  # アラート再送クールダウン
+RUBBER_FALLBACK_ALERT_MINUTES = 30  # スパイク系fallback 継続アラート閾値
+RUBBER_FALLBACK_ALERT_COOLDOWN_MINUTES = 30  # スパイク系fallbackアラート再送クールダウン
+QUIET_FALLBACK_ALERT_MINUTES = 60  # スパイクなし静観 継続アラート閾値 (通常動作なので高め)
+QUIET_FALLBACK_ALERT_COOLDOWN_MINUTES = 60  # スパイクなし長期継続アラート再送クールダウン
 
 
 def _read_safe(path: Path) -> dict:
@@ -59,10 +61,12 @@ def _check_rubber_fallback_duration(state_dir: Path) -> str | None:
         ts_str = entry.get("timestamp", "")
 
         is_fallback = "Rubber fallback:" in market_summary
-        # 「新規エントリー停止中」は意図的停止 → アラートカウント対象外
+        # 意図的な正常状態 → アラートカウント対象外
         is_intentional_stop = "新規エントリー停止中" in market_summary
+        # スパイクなし静観はゴム戦略の通常動作 (スパイク検知型なので大半の時間はスパイクなし)
+        is_normal_quiet = "スパイクなし" in market_summary
 
-        if not is_fallback or is_intentional_stop:
+        if not is_fallback or is_intentional_stop or is_normal_quiet:
             # スパイク系fallback以外のエントリーが見つかった → 連続区間終了
             break
 
@@ -247,6 +251,194 @@ def _check_rubber_fallback_duration(state_dir: Path) -> str | None:
 
 
 
+def _check_quiet_fallback_duration(state_dir: Path) -> str | None:
+    """「スパイクなし: 静観」fallback が QUIET_FALLBACK_ALERT_MINUTES 以上継続していればアラートを返す。
+
+    スパイクなし静観はゴム戦略の通常動作だが、60分超継続する場合は
+    市場が極めて低ボラ状態にあり、quiet_long 条件との比較や
+    vol_threshold 妥当性の診断が有用になる。
+
+    アラート状態は fallback_alert_state.json の `last_quiet_alert` で管理。
+
+    Returns:
+        アラートメッセージ (str) または None (閾値未満 or クールダウン中)。
+    """
+    ooda_log_path = state_dir / "ooda_log.json"
+    alert_state_path = state_dir / "fallback_alert_state.json"
+
+    try:
+        entries = read_json(ooda_log_path)
+        if not isinstance(entries, list) or not entries:
+            return None
+    except (FileNotFoundError, Exception):
+        return None
+
+    now = datetime.now(timezone.utc)
+
+    # 最新エントリーから遡り「スパイクなし: 静観」の連続区間を測定する
+    quiet_start: datetime | None = None
+    quiet_count = 0
+
+    for entry in reversed(entries):
+        market_summary = entry.get("market_summary", "")
+        ts_str = entry.get("timestamp", "")
+
+        is_quiet_fallback = (
+            "Rubber fallback:" in market_summary
+            and "スパイクなし" in market_summary
+        )
+        if not is_quiet_fallback:
+            break
+
+        quiet_count += 1
+        try:
+            ts = datetime.fromisoformat(ts_str)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            quiet_start = ts
+        except (ValueError, TypeError):
+            continue
+
+    if quiet_start is None or quiet_count == 0:
+        return None
+
+    quiet_minutes = (now - quiet_start).total_seconds() / 60.0
+    logger.info(
+        "Quiet fallback duration: %.1f min (threshold=%d min, cycles=%d)",
+        quiet_minutes, QUIET_FALLBACK_ALERT_MINUTES, quiet_count,
+    )
+
+    if quiet_minutes < QUIET_FALLBACK_ALERT_MINUTES:
+        return None
+
+    # クールダウンチェック (quiet専用キー: last_quiet_alert)
+    try:
+        alert_state = read_json(alert_state_path)
+        if not isinstance(alert_state, dict):
+            alert_state = {}
+    except (FileNotFoundError, Exception):
+        alert_state = {}
+
+    last_alert_str = alert_state.get("last_quiet_alert")
+    if last_alert_str:
+        try:
+            last_alert = datetime.fromisoformat(last_alert_str)
+            if last_alert.tzinfo is None:
+                last_alert = last_alert.replace(tzinfo=timezone.utc)
+            elapsed = (now - last_alert).total_seconds() / 60.0
+            if elapsed < QUIET_FALLBACK_ALERT_COOLDOWN_MINUTES:
+                logger.debug(
+                    "Quiet fallback alert suppressed: cooldown %.1f/%.1f min",
+                    elapsed, QUIET_FALLBACK_ALERT_COOLDOWN_MINUTES,
+                )
+                return None
+        except (ValueError, TypeError):
+            pass
+
+    # アーカイブで開始時刻を補正 (ログ全件がquiet fallbackの場合)
+    archive_extended = False
+    if quiet_count == len(entries):
+        try:
+            archive_dir = state_dir / "ooda_archive"
+            archive_files = sorted(archive_dir.glob("*.json"), reverse=True)
+            if archive_files:
+                arc_entries = read_json(archive_files[0])
+                if isinstance(arc_entries, list) and arc_entries:
+                    for arc_entry in reversed(arc_entries):
+                        arc_ms = arc_entry.get("market_summary", "")
+                        if (
+                            "Rubber fallback:" in arc_ms
+                            and "スパイクなし" in arc_ms
+                        ):
+                            ts_str = arc_entry.get("timestamp", "")
+                            try:
+                                ts = datetime.fromisoformat(ts_str)
+                                if ts.tzinfo is None:
+                                    ts = ts.replace(tzinfo=timezone.utc)
+                                quiet_start = ts
+                                quiet_count += 1
+                                archive_extended = True
+                            except (ValueError, TypeError):
+                                pass
+                        else:
+                            break
+        except Exception:
+            pass
+
+    if archive_extended:
+        quiet_minutes = (now - quiet_start).total_seconds() / 60.0
+        logger.info(
+            "Quiet fallback start extended via archive: %.1f min total (%d+ cycles)",
+            quiet_minutes, quiet_count,
+        )
+
+    # 市場データから現在のvol_ratio と quiet_long 条件を診断
+    QUIET_LONG_VOL_MAX = 0.3  # ETH quiet_long 条件: vol_ratio < 0.3x
+    SPIKE_THRESHOLD = {"BTC": 5.0, "SOL": 5.0}
+    diagnosis_lines = []
+    try:
+        market_data_path = state_dir.parent / "data" / "market_data.json"
+        market_data = read_json(market_data_path)
+        symbols = market_data.get("symbols", {}) if isinstance(market_data, dict) else {}
+        for sym in ["BTC", "ETH", "SOL"]:
+            sym_data = symbols.get(sym, {})
+            mid_price = sym_data.get("mid_price")
+            candles = sym_data.get("candles_5m", [])
+            if len(candles) >= 20 and mid_price:
+                vols = [float(c.get("v") or 0) for c in candles]
+                recent_vol = vols[-1]
+                avg_vol = sum(vols[-20:-1]) / 19 if len(vols) >= 20 else 1
+                vol_ratio = recent_vol / avg_vol if avg_vol > 0 else 0
+                threshold = SPIKE_THRESHOLD.get(sym)
+                if threshold:
+                    gap_pct = (vol_ratio / threshold) * 100
+                    diagnosis_lines.append(
+                        f"  {sym}: vol_ratio={vol_ratio:.2f}x / spike閾値{threshold:.0f}x"
+                        f" ({gap_pct:.0f}%)  price={mid_price:,.0f}"
+                    )
+                else:
+                    # ETH: quiet_long 条件との比較
+                    in_quiet = "✓" if vol_ratio < QUIET_LONG_VOL_MAX else "✗"
+                    diagnosis_lines.append(
+                        f"  {sym}: vol_ratio={vol_ratio:.2f}x (quiet_long条件<{QUIET_LONG_VOL_MAX}x {in_quiet})"
+                        f"  price={mid_price:,.0f}"
+                    )
+    except Exception:
+        pass
+
+    # 継続時間に応じた推奨アクション
+    if quiet_minutes >= 180:
+        action = "180分超: 市場が極低ボラ帯。vol_threshold 緩和 or quiet_long 条件緩和を検討"
+    elif quiet_minutes >= 120:
+        action = "120分超: quiet_long 条件 (h4_range_position, vol_ratio) の現状確認を推奨"
+    else:
+        action = "60分超: 低ボラ継続中。quiet_long がエントリーできていない場合は条件確認"
+
+    # アラート送信時刻を記録
+    alert_state["last_quiet_alert"] = now.isoformat()
+    alert_state["last_quiet_duration_min"] = round(quiet_minutes, 1)
+    try:
+        from src.utils.file_lock import atomic_write_json
+        atomic_write_json(alert_state_path, alert_state)
+    except Exception as e:
+        logger.warning("fallback_alert_state (quiet) 保存失敗: %s", e)
+
+    quiet_start_str = quiet_start.strftime("%H:%M UTC")
+    suffix = "+" if archive_extended else ""
+    msg_lines = [
+        f"スパイクなし静観 継続 {quiet_minutes:.0f}分 ({quiet_count}{suffix}サイクル)",
+        f"開始: {quiet_start_str}",
+    ]
+    if diagnosis_lines:
+        msg_lines.append("現在のvol_ratio状況:")
+        msg_lines.extend(diagnosis_lines)
+    msg_lines.append(f"推奨: {action}")
+
+    msg = "\n".join(msg_lines)
+    logger.warning("Quiet fallback alert: %s", msg.replace("\n", " | "))
+    return msg
+
+
 def _close_all_positions() -> None:
     """Emergency close all open positions."""
     try:
@@ -381,6 +573,12 @@ def run_monitor() -> None:
         # fallback アラートは即時 Telegram 送信 (他のアラートとは独立して通知)
         send_message(f"*Rubber Fallback Alert*\n{fallback_alert}")
         alerts.append(fallback_alert)
+
+    # 4d. スパイクなし静観 長期継続アラート (60分超えで低ボラ診断を促進)
+    quiet_alert = _check_quiet_fallback_duration(state_dir)
+    if quiet_alert:
+        send_message(f"*Rubber 低ボラ継続 Alert*\n{quiet_alert}")
+        alerts.append(quiet_alert)
 
     # 5. データ品質継続劣化チェック (data_health_summary の consecutive_low_score 監視)
     health_summary_path = state_dir / "data_health_summary.json"
