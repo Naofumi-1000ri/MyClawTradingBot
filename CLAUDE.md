@@ -106,6 +106,35 @@ make status     # 状態表示
 | `reference/docs/frequency_session_analysis.md` | FFT・セッション分析 (US Wave Rider, Mirror Theory等) |
 | `reference/docs/issues.md` | 未解決の問題・要検討事項 |
 
+## コード変更時の必須手順
+
+**テストを壊すコードをcommitするな。以下を必ず守ること。**
+
+### コード変更前
+```bash
+make test    # 現状テスト全パス (70件) を確認してから着手
+```
+
+### コード変更後
+```bash
+make test    # 回帰テスト全パス確認してからcommit
+```
+- テストが1件でも落ちたらcommitするな。修正してから。
+- 落ちたテストを「仕様変更」として安易にスキップ/削除するな。まず原因を調べろ。
+
+### 新戦略追加時
+```bash
+make pretest-strategy STRATEGY=src.strategy.new_strategy_module
+```
+- フォーマット検証 (必須フィールド、TP/SL方向)
+- リスク準拠検証 (leverage上限、size上限)
+- 品質検証 (PF > 0.5、勝率 > 10%)
+- **プレチェック全パスしてからデプロイ**
+
+### テスト関連ドキュメント
+- テスト構成・追加方法: `tests/README.md`
+- HLClient API仕様・モックパターン: `src/api/README.md`
+
 ## セキュリティ制約
 
 - `config/runtime.env` はgitignore済み (秘密鍵含む)
