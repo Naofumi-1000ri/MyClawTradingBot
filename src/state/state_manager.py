@@ -6,6 +6,7 @@ from pathlib import Path
 from src.utils.config_loader import get_state_dir
 from src.utils.file_lock import atomic_write_json, read_json
 from src.utils.logger import setup_logger
+from src.utils.safe_parse import parse_leverage, safe_float
 
 logger = setup_logger("state_manager")
 
@@ -42,44 +43,23 @@ class StateManager:
     def _sum_unrealized_from_positions(positions: list) -> float:
         total = 0.0
         for p in positions:
-            try:
-                total += float(p.get("unrealized_pnl", 0) or 0)
-            except Exception:
+            if not isinstance(p, dict):
                 continue
+            total += safe_float(p.get("unrealized_pnl", 0), label="unrealized_pnl")
         return total
 
-    def sync_positions(self, info, address: str) -> list:
-        """Sync positions from Hyperliquid API and save to state."""
+    def sync_positions(self, client) -> list:
+        """Sync positions from Hyperliquid API via HLClient and save to state."""
         try:
-            user_state = info.user_state(address)
-            mids = info.all_mids()
-            positions = []
-            for pos in user_state.get("assetPositions", []):
-                p = pos.get("position", {})
-                szi = float(p.get("szi", 0))
-                if szi == 0:
-                    continue
-                coin = p.get("coin", "")
-                mid = float(mids.get(coin, 0))
-                entry = float(p.get("entryPx", 0))
-                upnl = float(p.get("unrealizedPnl", 0))
-                positions.append({
-                    "symbol": coin,
-                    "side": "long" if szi > 0 else "short",
-                    "size": abs(szi),
-                    "entry_price": entry,
-                    "leverage": int(float(p["leverage"]["value"] if isinstance(p.get("leverage"), dict) else p.get("leverage") or 1)) if isinstance(p.get("leverage"), dict) else 1,
-                    "opened_at": None,
-                    "unrealized_pnl": upnl,
-                    "mid_price": mid,
-                })
+            positions = client.get_positions()
             self.save_positions(positions)
             logger.info("Synced %d positions from API", len(positions))
             # ポジション同期後、daily_pnl.unrealizedとの整合を補正
             self.reconcile_daily_unrealized(positions)
-            # ポジションがなくなった銘柄の rubber_meta.json を削除
-            # (trade_executorがBTCのrubber_meta削除をスキップするため、ここで補完)
+            # ポジションがなくなった銘柄の meta を削除
             active_symbols = {p["symbol"] for p in positions}
+
+            # Rubber meta (ETH/SOL用、BTC補完)
             for sym in ("BTC", "ETH", "SOL"):
                 meta_path = self.state_dir / f"{sym.lower()}_rubber_meta.json"
                 if sym not in active_symbols and meta_path.exists():
@@ -88,6 +68,29 @@ class StateManager:
                         logger.info("%s rubber meta cleared (no active position)", sym)
                     except Exception as e:
                         logger.warning("Failed to clear %s rubber meta: %s", sym, e)
+
+            # Wave Rider meta (BTC/HYPE)
+            wr_meta_files = {
+                "BTC": "btc_wave_rider_meta.json",
+                "HYPE": "hype_wave_rider_meta.json",
+            }
+            for sym, fname in wr_meta_files.items():
+                meta_path = self.state_dir / fname
+                if sym not in active_symbols and meta_path.exists():
+                    try:
+                        meta_path.unlink()
+                        logger.info("%s wave_rider meta cleared (no active position)", sym)
+                    except Exception as e:
+                        logger.warning("Failed to clear %s wave_rider meta: %s", sym, e)
+
+            # Reversion pending (BTC WR → REV 橋渡しファイル)
+            rev_pending = self.state_dir / "btc_wr_rev_pending.json"
+            if "BTC" not in active_symbols and rev_pending.exists():
+                try:
+                    rev_pending.unlink()
+                    logger.info("BTC reversion pending cleared (no active position)")
+                except Exception as e:
+                    logger.warning("Failed to clear reversion pending: %s", e)
             return positions
         except Exception as e:
             logger.error("Failed to sync positions: %s", e)

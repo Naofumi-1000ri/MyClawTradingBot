@@ -1,140 +1,19 @@
 """Market data collector for Hyperliquid."""
 
-import os
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from hyperliquid.info import Info
-
+from src.api.hl_client import HLClient
 from src.utils.config_loader import (
     get_data_dir,
-    get_hyperliquid_url,
     load_settings,
 )
 from src.utils.file_lock import atomic_write_json, read_json
 from src.utils.logger import setup_logger
 from src.utils.retry import RetryExhausted, call_with_retry, enter_safe_hold
+from src.utils.safe_parse import safe_float
 
 logger = setup_logger("data_collector")
-
-# 各時間足のミリ秒
-_INTERVAL_MS = {
-    "5m":  5 * 60 * 1000,
-    "15m": 15 * 60 * 1000,
-    "1h":  60 * 60 * 1000,
-    "4h":  4 * 60 * 60 * 1000,
-}
-
-# デフォルト取得本数
-_INTERVAL_DEFAULT_COUNT = {
-    "5m":  336,  # 288(24h) + 48(4hバッファ)
-    "15m": 96,   # 24時間分
-    "1h":  48,   # 2日分
-    "4h":  50,   # 8日分 (MACD(12,26,9)計算に35本必要なため余裕を持って50本)
-}
-
-
-def _build_info(settings: dict) -> Info:
-    """Create Hyperliquid Info client."""
-    base_url = get_hyperliquid_url(settings)
-    logger.info("Connecting to Hyperliquid: %s", base_url)
-    return Info(base_url, skip_ws=True)
-
-
-def _fetch_mid_prices(info: Info) -> dict[str, str]:
-    """Fetch all mid prices."""
-    return info.all_mids()
-
-
-def _fetch_candles(info: Info, symbol: str, interval: str = "15m", count: int | None = None) -> list[dict]:
-    """Fetch latest candles for a symbol at the given interval."""
-    if count is None:
-        count = _INTERVAL_DEFAULT_COUNT.get(interval, 24)
-    interval_ms = _INTERVAL_MS.get(interval, 15 * 60 * 1000)
-    now_ms = int(time.time() * 1000)
-    start_ms = now_ms - count * interval_ms - interval_ms  # バッファ1本分
-    candles = info.candles_snapshot(
-        name=symbol, interval=interval, startTime=start_ms, endTime=now_ms
-    )
-    return candles[-count:]
-
-
-def _fetch_orderbook(info: Info, symbol: str, depth: int = 5) -> dict:
-    """Fetch L2 orderbook snapshot (top N levels)."""
-    snapshot = info.l2_snapshot(name=symbol)
-    levels = snapshot.get("levels", [[], []])
-    bids = levels[0][:depth] if len(levels) > 0 else []
-    asks = levels[1][:depth] if len(levels) > 1 else []
-    return {
-        "bids": [{"px": lv["px"], "sz": lv["sz"]} for lv in bids],
-        "asks": [{"px": lv["px"], "sz": lv["sz"]} for lv in asks],
-    }
-
-
-def _fetch_funding_rates(info: Info) -> dict[str, float]:
-    """Fetch funding rates for all assets."""
-    meta, asset_ctxs = info.meta_and_asset_ctxs()
-    universe = meta.get("universe", [])
-    rates = {}
-    for i, asset in enumerate(universe):
-        name = asset.get("name", "")
-        if i < len(asset_ctxs):
-            funding = asset_ctxs[i].get("funding", "0")
-            rates[name] = float(funding)
-    return rates
-
-
-
-def _fetch_account_equity(info: Info, settings: dict) -> float:
-    """Fetch account equity from Hyperliquid.
-
-    統合口座(portfolio margin): spot USDC total + perps unrealized PnL。
-    標準口座(spot=0): perps accountValue をそのまま使用。
-    trade_executor._get_equity() と同一ロジック。
-    """
-    import requests as _req
-    main_address = os.environ.get("HYPERLIQUID_MAIN_ADDRESS", "").strip()
-    if not main_address:
-        return 0.0
-    try:
-        # Perps side — 最も信頼できるequity源
-        state = info.user_state(main_address)
-        perps_equity = float(state.get("marginSummary", {}).get("accountValue", 0))
-
-        # Spot side: USDC balance
-        spot_usdc = 0.0
-        base_url = get_hyperliquid_url(settings)
-        resp = _req.post(base_url + "/info",
-            json={"type": "spotClearinghouseState", "user": main_address}, timeout=5)
-        for b in resp.json().get("balances", []):
-            if b.get("coin") == "USDC":
-                spot_usdc = float(b.get("total", 0))
-                break
-
-        # 統合口座(portfolio margin): spot_usdc にマージン担保が含まれ、
-        # perps accountValue は担保を含まない(unrealized PnLのみ)。
-        # 正しい計算: spot_usdc + sum(perps unrealized PnL)
-        # 標準口座(spot=0): perps accountValue をそのまま使用。
-        total_upnl = 0.0
-        for p in state.get("assetPositions", []):
-            total_upnl += float(p.get("position", {}).get("unrealizedPnl", 0))
-
-        if spot_usdc > 0:
-            # 統合口座: spot に担保、perps_equity が負 (含み損) でも正しく反映
-            total = spot_usdc + total_upnl
-        elif perps_equity > 0:
-            total = perps_equity  # 標準口座
-        else:
-            total = 0.0
-
-        if total > 0:
-            logger.debug("Equity: perps_av=%.2f, spot=%.2f, total=%.2f",
-                         perps_equity, spot_usdc, total)
-            return total
-    except Exception as e:
-        logger.warning("Failed to fetch equity: %s", e)
-    return 0.0
 
 
 def collect(settings: dict | None = None) -> dict:
@@ -150,11 +29,10 @@ def collect(settings: dict | None = None) -> dict:
     data_dir = get_data_dir(settings)
     output_path = data_dir / "market_data.json"
 
-    # Info クライアント初期化 (最大2回リトライ)
+    # HLClient初期化 (最大2回リトライ)
     try:
-        info = call_with_retry(
-            _build_info,
-            args=(settings,),
+        client = call_with_retry(
+            lambda: HLClient(settings, read_only=True),
             max_retries=2,
             base_delay=3.0,
             backoff_factor=2.0,
@@ -174,10 +52,10 @@ def collect(settings: dict | None = None) -> dict:
         pass
 
     # Fetch shared data (リトライ付き)
+    # all_mids は raw string dict のまま取得 (後続の safe_float で個別変換)
     try:
         all_mids = call_with_retry(
-            _fetch_mid_prices,
-            args=(info,),
+            lambda: client.info.all_mids(),
             max_retries=2,
             base_delay=2.0,
             backoff_factor=2.0,
@@ -190,8 +68,7 @@ def collect(settings: dict | None = None) -> dict:
 
     try:
         funding_rates = call_with_retry(
-            _fetch_funding_rates,
-            args=(info,),
+            client.get_funding_rates,
             max_retries=2,
             base_delay=2.0,
             backoff_factor=2.0,
@@ -210,10 +87,12 @@ def collect(settings: dict | None = None) -> dict:
     for sym in symbols:
         prev_sym = prev_data.get("symbols", {}).get(sym, {})
 
-        # Mid price
+        # Mid price (allMids は全値がSTRING)
         mid = all_mids.get(sym)
         if mid is not None:
-            mid_price = float(mid)
+            mid_price = safe_float(mid, default=0.0, label=f"mid_price({sym})")
+            if mid_price <= 0:
+                mid_price = None
         elif prev_sym.get("mid_price") is not None:
             mid_price = prev_sym["mid_price"]
             logger.warning("Using previous mid_price for %s", sym)
@@ -228,8 +107,8 @@ def collect(settings: dict | None = None) -> dict:
             key = f"candles_{interval}"
             try:
                 fetched = call_with_retry(
-                    _fetch_candles,
-                    args=(info, sym, interval),
+                    client.get_candles,
+                    args=(sym, interval),
                     max_retries=2,
                     base_delay=2.0,
                     backoff_factor=2.0,
@@ -246,8 +125,8 @@ def collect(settings: dict | None = None) -> dict:
         # Orderbook - リトライ付き
         try:
             orderbook = call_with_retry(
-                _fetch_orderbook,
-                args=(info, sym),
+                client.get_orderbook,
+                args=(sym,),
                 kwargs={"depth": orderbook_depth},
                 max_retries=2,
                 base_delay=2.0,
@@ -271,8 +150,8 @@ def collect(settings: dict | None = None) -> dict:
         # 5m足追加取得 (ゴムの壁モデル + 将来のアルト分析用) - リトライ付き
         try:
             fetched_5m = call_with_retry(
-                _fetch_candles,
-                args=(info, sym, "5m", 336),
+                client.get_candles,
+                args=(sym, "5m", 336),
                 max_retries=2,
                 base_delay=2.0,
                 backoff_factor=2.0,
@@ -294,18 +173,16 @@ def collect(settings: dict | None = None) -> dict:
         }
 
     # Equity 取得 & ポジション同期 & daily_pnl 更新
-    equity = _fetch_account_equity(info, settings)
+    equity = client.get_equity()
     sm = None
     positions = []
     # ポジション同期 (Hyperliquid API -> positions.json)
-    main_address = os.environ.get("HYPERLIQUID_MAIN_ADDRESS", "").strip()
-    if main_address:
-        try:
-            from src.state.state_manager import StateManager
-            sm = StateManager()
-            positions = sm.sync_positions(info, main_address)
-        except Exception as e:
-            logger.warning("Failed to sync positions: %s", e)
+    try:
+        from src.state.state_manager import StateManager
+        sm = StateManager()
+        positions = sm.sync_positions(client)
+    except Exception as e:
+        logger.warning("Failed to sync positions: %s", e)
 
     if equity > 0:
         try:
@@ -314,7 +191,7 @@ def collect(settings: dict | None = None) -> dict:
                 sm = StateManager()
             if positions:
                 # sync 成功時のみ unrealized を更新 (空リストで 0 上書きしない)
-                api_unrealized = sum(float(p.get("unrealized_pnl", 0) or 0) for p in positions)
+                api_unrealized = sum(safe_float(p.get("unrealized_pnl", 0), label="sync_upnl") for p in positions)
                 sm.update_daily_pnl(equity, api_unrealized_pnl=api_unrealized)
             else:
                 # sync 失敗 or ポジションなし — equity のみ更新

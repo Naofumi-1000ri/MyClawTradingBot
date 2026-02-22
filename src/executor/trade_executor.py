@@ -5,18 +5,17 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-from eth_account import Account
-from hyperliquid.exchange import Exchange
-from hyperliquid.info import Info
-
+from src.api.hl_client import HLClient
 from src.state.state_manager import StateManager
 from src.utils.config_loader import (
-    get_hyperliquid_url,
     get_signals_dir,
+    get_state_dir,
+    load_risk_params,
     load_settings,
 )
 from src.utils.file_lock import read_json
 from src.utils.logger import setup_logger
+from src.utils.safe_parse import safe_float
 
 logger = setup_logger("executor")
 
@@ -28,32 +27,35 @@ class TradeExecutor:
         self.settings = load_settings()
         self.state = StateManager()
 
-        # Resolve private key
-        private_key = os.environ.get("HYPERLIQUID_PRIVATE_KEY")
-        if not private_key:
-            from src.utils.crypto import get_hyperliquid_key
-            private_key = get_hyperliquid_key()
-
-        self.account = Account.from_key(private_key)
-        self.address = self.account.address
-
-        # メインアカウントアドレス (API walletとは別)
-        main_address = os.environ.get("HYPERLIQUID_MAIN_ADDRESS", "").strip()
-        self.main_address = main_address if main_address else self.address
-
-        base_url = get_hyperliquid_url(self.settings)
-        # API wallet がサインし、main_address のアカウントで執行
-        self.exchange = Exchange(self.account, base_url, account_address=self.main_address)
-        self.info = Info(base_url, skip_ws=True)
+        self.client = HLClient(self.settings)
+        self.main_address = self.client._main_address
 
         trading_cfg = self.settings.get("trading", {})
         self.default_leverage = trading_cfg.get("default_leverage", 3)
         self.min_confidence = trading_cfg.get("min_confidence", 0.7)
+        self.risk_params = load_risk_params()
+        self.execution_mode = os.environ.get("EXECUTOR_MODE", "all").strip().lower() or "all"
+
+        gate_cfg = trading_cfg.get("decision_gate", {})
+        self.partial_consensus_min_confidence = float(
+            gate_cfg.get("partial_consensus_min_confidence", max(self.min_confidence, 0.75))
+        )
+        self.entry_cooldown_minutes = int(gate_cfg.get("entry_cooldown_minutes", 10))
+        self.max_equity_drift_pct = float(gate_cfg.get("max_equity_drift_pct", 20.0))
+        self.max_daily_loss_for_new_entries_pct = float(
+            gate_cfg.get("max_daily_loss_for_new_entries_pct", 2.0)
+        )
+        self.min_rr = float(gate_cfg.get("min_rr", 1.2))
+        self.min_data_quality_score = int(gate_cfg.get("min_data_quality_score", 80))
+        self.max_spread_bps = float(gate_cfg.get("max_spread_bps", 8.0))
+        self.min_orderbook_imbalance = float(gate_cfg.get("min_orderbook_imbalance", 1.1))
+        self.min_orderbook_imbalance_by_symbol = gate_cfg.get("min_orderbook_imbalance_by_symbol", {}) or {}
 
         logger.info(
-            "TradeExecutor initialized (env=%s, address=%s)",
+            "TradeExecutor initialized (env=%s, address=%s, mode=%s)",
             self.settings.get("environment", "testnet"),
-            self.address,
+            self.client.address,
+            self.execution_mode,
         )
 
     # -- Public API --
@@ -90,7 +92,15 @@ class TradeExecutor:
 
         # Sync positions after all executions
         if results:
-            self.state.sync_positions(self.info, self.main_address)
+            positions = self.state.sync_positions(self.client)
+            # 実行後のstate整合を確保
+            try:
+                equity = self.client.get_equity()
+                api_unrealized = sum(float(p.get("unrealized_pnl", 0) or 0) for p in positions)
+                if equity > 0:
+                    self.state.update_daily_pnl(equity, api_unrealized_pnl=api_unrealized)
+            except Exception:
+                logger.exception("Failed to reconcile daily_pnl after executions")
 
         return results
 
@@ -107,20 +117,25 @@ class TradeExecutor:
         action = signal.get("action", "hold")
         confidence = signal.get("confidence", 0)
 
-        # Skip low-confidence or hold signals
-        if confidence < self.min_confidence:
-            logger.info("Skipping %s: confidence %.2f < %.2f", symbol, confidence, self.min_confidence)
+        # Execution mode filter
+        if self.execution_mode == "close_only" and action != "close":
+            logger.info("Skipping %s %s: executor mode is close_only", action, symbol)
             return None
-        if action == "hold":
-            logger.info("Skipping %s: action is hold", symbol)
+
+        if action in ("hold", "hold_position"):
+            logger.info("Skipping %s: action is %s", symbol, action)
+            return None
+        # Skip low-confidence signals
+        if action != "close" and confidence < self.min_confidence:
+            logger.info("Skipping %s: confidence %.2f < %.2f", symbol, confidence, self.min_confidence)
             return None
 
         # Risk validation
+        equity = self.client.get_equity()
+        positions = self.state.get_positions()
         try:
             from src.risk.risk_manager import RiskManager
             rm = RiskManager()
-            positions = self.state.get_positions()
-            equity = self._get_equity()
             allowed, reason = rm.validate_signal(signal, positions, equity)
             if not allowed:
                 logger.warning("Risk rejected %s %s: %s", action, symbol, reason)
@@ -131,11 +146,20 @@ class TradeExecutor:
             logger.error("RiskManager error: %s - rejecting signal for safety", exc)
             return {"symbol": symbol, "action": action, "status": "rejected", "reason": f"risk check error: {exc}"}
 
+        if action in ("long", "short"):
+            allowed, reason = self._composite_entry_gate(signal, equity)
+            if not allowed:
+                logger.warning("Composite gate rejected %s %s: %s", action, symbol, reason)
+                return {"symbol": symbol, "action": action, "status": "rejected", "reason": reason}
+
         # Execute
         leverage = signal.get("leverage", self.default_leverage)
         try:
             if action == "close":
-                return self.close_position(symbol)
+                result = self.close_position(symbol)
+                if result and result.get("status") == "closed" and symbol in ("ETH", "SOL"):
+                    self._clear_rubber_meta(symbol)
+                return result
             elif action in ("long", "short"):
                 size = signal.get("size")
                 if size is None:
@@ -143,7 +167,15 @@ class TradeExecutor:
                     size = self._calculate_size(symbol, leverage)
                     if size is None:
                         return {"symbol": symbol, "action": action, "status": "error", "reason": "failed to calculate size"}
-                return self.open_position(symbol, action, size, leverage)
+                else:
+                    price = self.client.get_mid_prices().get(symbol, 0.0)
+                    size = self._apply_size_caps(symbol, float(size), price, equity)
+                    if size is None:
+                        return {"symbol": symbol, "action": action, "status": "rejected", "reason": "size blocked by hard cap"}
+                result = self.open_position(symbol, action, size, leverage)
+                if result and result.get("status") in ("filled", "partial"):
+                    self._save_rubber_meta(signal, result)
+                return result
             else:
                 logger.warning("Unknown action '%s' for %s", action, symbol)
                 return None
@@ -163,24 +195,20 @@ class TradeExecutor:
         Returns:
             Result dict with execution details.
         """
-        is_buy = side == "long"
         logger.info("Opening %s %s %.4f (leverage=%d)", side, symbol, size, leverage)
 
-        # Set leverage first
-        self.exchange.update_leverage(leverage, symbol)
+        order_result = self.client.place_market_order(symbol, side, size, leverage)
+        status = order_result["status"]
+        fill_price = order_result["fill_price"]
+        resp = order_result["raw_response"]
 
-        # Market order
-        resp = self.exchange.market_open(symbol, is_buy, size, px=None, slippage=0.01)
-        logger.info("Order response: %s", resp)
+        if status == "error":
+            logger.error("Order error for %s: %s", symbol, order_result.get("error"))
+            return {"symbol": symbol, "action": side, "status": "error",
+                    "reason": order_result.get("error", "unknown")}
 
-        fill_price = _extract_fill_price(resp)
-        if _is_order_success(resp) and fill_price > 0:
-            status = "filled"
-        elif _is_order_partial(resp):
-            status = "partial"
+        if status == "partial":
             logger.warning("Partial fill for %s %s (order resting on book)", side, symbol)
-        else:
-            status = "failed"
 
         if status in ("filled", "partial") and fill_price > 0:
             self.state.record_trade({
@@ -219,11 +247,14 @@ class TradeExecutor:
         positions = self.state.get_positions()
         existing = next((p for p in positions if p.get("symbol") == symbol), None)
 
-        resp = self.exchange.market_close(symbol)
-        logger.info("Close response: %s", resp)
+        close_result = self.client.close_position(symbol)
+        status = close_result["status"]
+        fill_price = close_result["fill_price"]
+        resp = close_result["raw_response"]
 
-        status = "closed" if _is_order_success(resp) else "failed"
-        fill_price = _extract_fill_price(resp)
+        if status == "no_position":
+            logger.warning("market_close returned None for %s (position already closed?)", symbol)
+            return {"symbol": symbol, "action": "close", "status": "no_position", "fill_price": 0.0}
 
         if status == "closed" and existing:
             entry_price = existing.get("entry_price", 0)
@@ -244,7 +275,7 @@ class TradeExecutor:
 
             # Update daily P&L with realized
             try:
-                equity = self._get_equity()
+                equity = self.client.get_equity()
                 self.state.update_daily_pnl(equity, realized_pnl=pnl)
             except Exception:
                 logger.exception("Failed to update daily P&L after close")
@@ -260,55 +291,51 @@ class TradeExecutor:
     # -- Helpers --
 
 
-    def _get_equity(self) -> float:
-        """Get account equity. Supports both regular and unified (portfolio margin) accounts.
-
-        For unified accounts, spot USDC is used as equity since marginSummary shows 0.
-        """
-        import requests
-        try:
-            # まず marginSummary を確認
-            user_state = self.info.user_state(self.main_address)
-            equity = float(user_state.get("marginSummary", {}).get("accountValue", 0))
-            if equity > 0:
-                return equity
-
-            # 統合口座: spot USDC を使用
-            base_url = get_hyperliquid_url(self.settings)
-            resp = requests.post(
-                base_url + "/info",
-                json={"type": "spotClearinghouseState", "user": self.main_address},
-                timeout=5,
-            )
-            for b in resp.json().get("balances", []):
-                if b.get("coin") == "USDC":
-                    return float(b.get("total", 0))
-        except Exception:
-            logger.exception("Failed to get equity")
-        return 0.0
-
     def _calculate_size(self, symbol: str, leverage: int) -> float | None:
         """Calculate position size based on equity and risk params."""
         try:
-            from src.utils.config_loader import load_risk_params
-            risk_params = load_risk_params()
+            risk_params = self.risk_params
             max_pct = risk_params.get("position", {}).get("max_single_pct", 10.0)
+            max_total_pct = risk_params.get("position", {}).get("max_total_exposure_pct", 30.0)
 
-            user_state = self.info.user_state(self.main_address)
-            equity = float(user_state.get("marginSummary", {}).get("accountValue", 0))
+            equity = self.client.get_equity()
+            if equity <= 0:
+                logger.error("Equity is zero or negative, cannot calculate size")
+                return None
 
             # Get mid price
-            mids = self.info.all_mids()
-            price = float(mids.get(symbol, 0))
+            mids = self.client.get_mid_prices()
+            price = mids.get(symbol, 0.0)
             if price <= 0:
                 logger.error("Cannot get price for %s", symbol)
                 return None
 
-            # 証拠金 = equity × max_pct%、notional = 証拠金 × leverage
-            # (leverage を証拠金に掛けてnotionalを算出 — 証拠金はmax_pct%以内に制限)
-            margin = equity * (max_pct / 100.0)
+            # 証拠金 = equity × max_pct% × size_multiplier
+            size_mult, size_reason = self._get_size_regime_multiplier()
+            margin = equity * (max_pct / 100.0) * size_mult
             notional = margin * leverage
+
+            # Total exposure 上限チェック: 既存ポジション + 新規 <= max_total_pct%
+            positions = self.state.get_positions()
+            current_exposure = sum(
+                abs(float(p.get("size", 0))) * float(p.get("mid_price", 0) or p.get("entry_price", 0))
+                for p in positions
+            )
+            max_total_notional = equity * (max_total_pct / 100.0)
+            remaining = max_total_notional - current_exposure
+            min_order_usd = risk_params.get("orders", {}).get("min_order_size_usd", 10.0)
+            if remaining < min_order_usd:
+                logger.warning("Total exposure limit reached: current=%.2f, max=%.2f, equity=%.2f",
+                               current_exposure, max_total_notional, equity)
+                return None
+            if notional > remaining:
+                logger.info("Capping notional %.2f -> %.2f (total exposure limit)", notional, remaining)
+                notional = remaining
+
             size = notional / price
+            size = self._apply_size_caps(symbol, size, price, equity)
+            if size is None:
+                return None
 
             # Round to reasonable precision
             if price > 10000:
@@ -318,50 +345,357 @@ class TradeExecutor:
             else:
                 size = round(size, 2)
 
+            logger.info("Size calculated: %s size=%.4f notional=%.2f margin=%.2f equity=%.2f exposure=%.2f",
+                        symbol, size, notional, margin, equity, current_exposure + notional)
+            logger.info("Size regime applied: x%.2f (%s)", size_mult, size_reason)
+
             return size if size > 0 else None
         except Exception:
             logger.exception("Error calculating size for %s", symbol)
             return None
 
+    def _load_market_symbol_data(self, symbol: str) -> dict:
+        path = Path("data/market_data.json")
+        try:
+            data = read_json(path)
+        except Exception:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        symbols = data.get("symbols", {})
+        if not isinstance(symbols, dict):
+            return {}
+        sym = symbols.get(symbol, {})
+        return sym if isinstance(sym, dict) else {}
 
-def _is_order_success(resp: dict) -> bool:
-    """Check if an exchange response indicates a fully filled order."""
-    if not isinstance(resp, dict) or resp.get("status") != "ok":
-        return False
-    response = resp.get("response", {})
-    if isinstance(response, dict) and response.get("type") == "order":
-        data = response.get("data", {})
-        if isinstance(data, dict) and data.get("statuses"):
-            return any(s.get("filled") for s in data["statuses"])
-    return False
+    def _get_size_regime_multiplier(self) -> tuple[float, str]:
+        path = get_state_dir(self.settings) / "size_regime.json"
+        try:
+            data = read_json(path)
+        except Exception:
+            return 1.0, "size_regime unavailable"
+        if not isinstance(data, dict):
+            return 1.0, "size_regime invalid"
+        try:
+            mult = float(data.get("multiplier", 1.0))
+        except Exception:
+            mult = 1.0
+        if mult <= 0:
+            mult = 1.0
+        reason = str(data.get("reason", "unknown"))
+        return mult, reason
 
+    def _composite_entry_gate(self, signal: dict, live_equity: float) -> tuple[bool, str]:
+        """Run multi-factor gate before any new long/short entry."""
+        reasons = []
+        symbol = signal.get("symbol", "")
+        action = signal.get("action", "")
 
-def _is_order_partial(resp: dict) -> bool:
-    """Check if an order is resting (partial fill or unfilled)."""
-    if not isinstance(resp, dict) or resp.get("status") != "ok":
-        return False
-    response = resp.get("response", {})
-    if isinstance(response, dict) and response.get("type") == "order":
-        data = response.get("data", {})
-        if isinstance(data, dict) and data.get("statuses"):
-            return any(s.get("resting") for s in data["statuses"])
-    return False
+        ok, reason = self._check_equity_consistency(live_equity)
+        if not ok:
+            reasons.append(reason)
 
+        ok, reason = self._check_consensus_quality(signal)
+        if not ok:
+            reasons.append(reason)
 
-def _extract_fill_price(resp: dict) -> float:
-    """Extract the fill price from an exchange response, or 0.0 if unavailable."""
-    try:
-        response = resp.get("response", {})
-        if isinstance(response, dict) and response.get("type") == "order":
-            data = response.get("data", {})
-            if isinstance(data, dict):
-                for s in data.get("statuses", []):
-                    filled = s.get("filled")
-                    if isinstance(filled, dict):
-                        return float(filled.get("avgPx", 0))
-    except (AttributeError, TypeError, ValueError):
-        pass
-    return 0.0
+        ok, reason = self._check_daily_loss_budget()
+        if not ok:
+            reasons.append(reason)
+
+        ok, reason = self._check_data_quality()
+        if not ok:
+            reasons.append(reason)
+
+        ok, reason = self._check_mm_context(symbol, action)
+        if not ok:
+            reasons.append(reason)
+
+        ok, reason = self._check_entry_cooldown(symbol)
+        if not ok:
+            reasons.append(reason)
+
+        ok, reason = self._check_rr(signal, action)
+        if not ok:
+            reasons.append(reason)
+
+        if reasons:
+            return False, " | ".join(reasons)
+        return True, "composite gate passed"
+
+    def _check_data_quality(self) -> tuple[bool, str]:
+        """Block new entries when data quality score is below threshold."""
+        report_path = get_state_dir(self.settings) / "data_health.json"
+        try:
+            report = read_json(report_path)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return False, "data_health report missing"
+
+        score = int(report.get("score", 0)) if isinstance(report, dict) else 0
+        if score < self.min_data_quality_score:
+            return False, f"data quality score {score} < {self.min_data_quality_score}"
+        return True, f"data quality ok ({score})"
+
+    def _check_mm_context(self, symbol: str, action: str) -> tuple[bool, str]:
+        """MM-aware gate: spread must be tight and orderbook side should support direction."""
+        sym = self._load_market_symbol_data(symbol)
+        if not sym:
+            return True, "MM check skipped (no market snapshot)"
+
+        ob = sym.get("orderbook", {})
+        if not isinstance(ob, dict):
+            return False, "MM check failed (orderbook missing)"
+        bids = ob.get("bids", [])
+        asks = ob.get("asks", [])
+        if not bids or not asks:
+            return False, "MM check failed (empty orderbook)"
+
+        try:
+            best_bid = float(bids[0].get("px", 0))
+            best_ask = float(asks[0].get("px", 0))
+            mid = float(sym.get("mid_price", 0) or 0)
+        except Exception:
+            return False, "MM check failed (invalid prices)"
+
+        if best_bid <= 0 or best_ask <= best_bid or mid <= 0:
+            return False, "MM check failed (bad bid/ask geometry)"
+
+        spread_bps = ((best_ask - best_bid) / mid) * 10000
+        if spread_bps > self.max_spread_bps:
+            return False, f"spread {spread_bps:.2f}bps > {self.max_spread_bps:.2f}bps"
+
+        bid_sz = sum(float(x.get("sz", 0) or 0) for x in bids[:5])
+        ask_sz = sum(float(x.get("sz", 0) or 0) for x in asks[:5])
+        if bid_sz <= 0 or ask_sz <= 0:
+            return False, "MM check failed (invalid depth size)"
+
+        imbalance = bid_sz / ask_sz
+        sym_threshold = self.min_orderbook_imbalance
+        raw_sym_th = self.min_orderbook_imbalance_by_symbol.get(symbol)
+        if raw_sym_th is not None:
+            try:
+                parsed = float(raw_sym_th)
+                if parsed > 0:
+                    sym_threshold = parsed
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid min_orderbook_imbalance_by_symbol for %s: %s",
+                    symbol,
+                    raw_sym_th,
+                )
+
+        if action == "long" and imbalance < sym_threshold:
+            return False, (
+                f"long blocked by imbalance {imbalance:.2f} < "
+                f"{sym_threshold:.2f}"
+            )
+        if action == "short":
+            short_limit = 1.0 / sym_threshold
+            if imbalance > short_limit:
+                return False, f"short blocked by imbalance {imbalance:.2f} > {short_limit:.2f}"
+
+        return True, f"MM ok (spread={spread_bps:.2f}bps, imbalance={imbalance:.2f})"
+
+    def _check_equity_consistency(self, live_equity: float) -> tuple[bool, str]:
+        """Reject new entries when live equity and state equity diverge too much."""
+        daily = self.state.get_daily_pnl()
+        state_equity = float(daily.get("equity") or 0)
+        if live_equity <= 0 or state_equity <= 0:
+            return False, "equity unavailable"
+
+        drift_pct = abs(live_equity - state_equity) / state_equity * 100
+        if drift_pct > self.max_equity_drift_pct:
+            return False, (
+                f"equity drift {drift_pct:.1f}% > {self.max_equity_drift_pct:.1f}% "
+                f"(live={live_equity:.2f}, state={state_equity:.2f})"
+            )
+        return True, "equity consistent"
+
+    def _check_consensus_quality(self, signal: dict) -> tuple[bool, str]:
+        """Require stronger confidence for partial consensus decisions."""
+        reasoning = str(signal.get("reasoning", ""))
+        conf = float(signal.get("confidence") or 0)
+        if "部分IN" in reasoning and conf < self.partial_consensus_min_confidence:
+            return False, (
+                f"partial consensus conf {conf:.2f} < "
+                f"{self.partial_consensus_min_confidence:.2f}"
+            )
+        return True, "consensus quality ok"
+
+    def _check_daily_loss_budget(self) -> tuple[bool, str]:
+        """Block new entries after daily loss exceeds strategy budget."""
+        daily = self.state.get_daily_pnl()
+        start = float(daily.get("start_of_day_equity") or 0)
+        if start <= 0:
+            return True, "daily budget unknown"
+
+        realized = float(daily.get("realized_pnl") or 0)
+        unrealized = float(daily.get("unrealized_pnl") or 0)
+        total = realized + unrealized
+        loss_pct = max(0.0, (-total / start) * 100)
+        if loss_pct >= self.max_daily_loss_for_new_entries_pct:
+            return False, (
+                f"daily loss {loss_pct:.2f}% >= "
+                f"{self.max_daily_loss_for_new_entries_pct:.2f}% budget"
+            )
+        return True, "daily budget ok"
+
+    def _check_entry_cooldown(self, symbol: str) -> tuple[bool, str]:
+        """Prevent rapid churn by enforcing cooldown after last symbol event."""
+        history_path = get_state_dir(self.settings) / "trade_history.json"
+        try:
+            history = read_json(history_path)
+            if not isinstance(history, list) or not history:
+                return True, "no trade history"
+        except (FileNotFoundError, json.JSONDecodeError):
+            return True, "no trade history"
+
+        latest = None
+        for trade in reversed(history):
+            if trade.get("symbol") != symbol:
+                continue
+            ts = trade.get("closed_at") or trade.get("opened_at") or trade.get("recorded_at")
+            if ts:
+                latest = ts
+                break
+        if not latest:
+            return True, "no recent symbol trade"
+
+        try:
+            last_dt = datetime.fromisoformat(latest)
+        except ValueError:
+            return True, "invalid trade timestamp"
+
+        now = datetime.now(timezone.utc)
+        elapsed_min = (now - last_dt).total_seconds() / 60.0
+        if elapsed_min < self.entry_cooldown_minutes:
+            return False, (
+                f"cooldown active for {symbol}: {elapsed_min:.1f}m < "
+                f"{self.entry_cooldown_minutes}m"
+            )
+        return True, "cooldown passed"
+
+    def _check_rr(self, signal: dict, action: str) -> tuple[bool, str]:
+        """Validate RR when entry/SL/TP are available."""
+        # Time-cut signals use dummy TP — RR check は無意味
+        if signal.get("exit_mode") == "time_cut":
+            return True, "RR check skipped (time_cut exit)"
+
+        entry = signal.get("entry_price")
+        sl = signal.get("stop_loss")
+        tp = signal.get("take_profit")
+
+        try:
+            entry = float(entry) if entry is not None else None
+            sl = float(sl) if sl is not None else None
+            tp = float(tp) if tp is not None else None
+        except (TypeError, ValueError):
+            return False, "invalid entry/SL/TP values"
+
+        if not entry or not sl or not tp:
+            return True, "RR check skipped (entry/SL/TP missing)"
+
+        if action == "long":
+            risk = entry - sl
+            reward = tp - entry
+        else:
+            risk = sl - entry
+            reward = entry - tp
+
+        if risk <= 0 or reward <= 0:
+            return False, f"invalid RR geometry (risk={risk:.6f}, reward={reward:.6f})"
+
+        rr = reward / risk
+        if rr < self.min_rr:
+            return False, f"RR {rr:.2f} < minimum {self.min_rr:.2f}"
+        return True, f"RR ok ({rr:.2f})"
+
+    def _save_rubber_meta(self, signal: dict, result: dict) -> None:
+        """Rubber position のメタデータを保存。executor fill 後に呼ぶ。ETH/SOL共通。"""
+        symbol = signal.get("symbol")
+        if symbol not in ("ETH", "SOL") or not signal.get("pattern"):
+            return
+
+        meta = {
+            "pattern": signal.get("pattern"),
+            "direction": signal.get("action"),
+            "entry_price": result.get("fill_price", 0),
+            "stop_loss": signal.get("stop_loss"),
+            "take_profit": signal.get("take_profit"),
+            "exit_mode": signal.get("exit_mode", "tp_sl"),
+            "exit_bars": signal.get("exit_bars", 0),
+            "bar_count": 0,
+            "entry_time": datetime.now(timezone.utc).isoformat(),
+            "vol_ratio": signal.get("vol_ratio"),
+        }
+        meta_path = get_state_dir(self.settings) / f"{symbol.lower()}_rubber_meta.json"
+        try:
+            meta_path.write_text(json.dumps(meta, indent=2))
+            logger.info("%s rubber meta saved: %s %s (exit_mode=%s)",
+                        symbol, meta["pattern"], meta["direction"], meta["exit_mode"])
+        except Exception:
+            logger.exception("Failed to save %s rubber meta", symbol)
+
+    # Backward compatibility alias
+    _save_eth_rubber_meta = _save_rubber_meta
+
+    def _clear_rubber_meta(self, symbol: str) -> None:
+        """Rubber position のメタデータを削除。close 後に呼ぶ。ETH/SOL共通。"""
+        meta_path = get_state_dir(self.settings) / f"{symbol.lower()}_rubber_meta.json"
+        try:
+            meta_path.unlink()
+            logger.info("%s rubber meta cleared", symbol)
+        except FileNotFoundError:
+            pass
+
+    # Backward compatibility alias
+    _clear_eth_rubber_meta = lambda self: self._clear_rubber_meta("ETH")
+
+    def _apply_size_caps(self, symbol: str, size: float, price: float, equity: float) -> float | None:
+        """Apply hard caps by symbol / notional / equity percentage."""
+        if size <= 0 or price <= 0:
+            return None
+
+        position_cfg = self.risk_params.get("position", {})
+        capped = size
+
+        symbol_caps = position_cfg.get("max_size_by_symbol", {}) or {}
+        sym_cap = symbol_caps.get(symbol)
+        if sym_cap is not None:
+            sym_cap = float(sym_cap)
+            if sym_cap > 0 and capped > sym_cap:
+                logger.warning("Hard-cap size for %s: %.4f -> %.4f", symbol, capped, sym_cap)
+                capped = sym_cap
+
+        max_notional_usd = float(position_cfg.get("max_notional_usd_per_trade", 0) or 0)
+        if max_notional_usd > 0:
+            notional_cap_size = max_notional_usd / price
+            if capped > notional_cap_size:
+                logger.warning(
+                    "Notional cap for %s: %.4f -> %.4f (%.2f USD)",
+                    symbol, capped, notional_cap_size, max_notional_usd
+                )
+                capped = notional_cap_size
+
+        max_notional_pct = float(position_cfg.get("max_notional_pct_of_equity", 0) or 0)
+        if max_notional_pct > 0 and equity > 0:
+            notional_cap_size = (equity * (max_notional_pct / 100.0)) / price
+            if capped > notional_cap_size:
+                logger.warning(
+                    "Equity-notional cap for %s: %.4f -> %.4f (%.1f%% equity)",
+                    symbol, capped, notional_cap_size, max_notional_pct
+                )
+                capped = notional_cap_size
+
+        min_order_usd = float(self.risk_params.get("orders", {}).get("min_order_size_usd", 10.0) or 10.0)
+        if capped * price < min_order_usd:
+            logger.warning(
+                "Capped size below min order for %s: size=%.6f notional=%.2f < %.2f",
+                symbol, capped, capped * price, min_order_usd
+            )
+            return None
+
+        return capped if capped > 0 else None
 
 
 if __name__ == "__main__":
